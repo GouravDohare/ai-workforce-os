@@ -209,8 +209,48 @@ def diagnostics_openai():
             "key_present": True,
         }, status_code=502)
 
+@app.get("/diagnostics/generation", response_class=JSONResponse)
+def diagnostics_generation():
+    """Make exactly one tiny real Responses API generation request."""
+    key = os.getenv("OPENAI_API_KEY")
+    model_name = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+    if not key:
+        return JSONResponse({
+            "status": "failed",
+            "error_type": "ConfigurationError",
+            "message": "OPENAI_API_KEY is not configured",
+            "model": model_name,
+        }, status_code=500)
+
+    try:
+        from openai import OpenAI
+        print(f"GENERATION_DIAGNOSTIC_START model={model_name}", flush=True)
+        client = OpenAI(api_key=key, timeout=60.0, max_retries=0)
+        response = client.responses.create(
+            model=model_name,
+            input="Reply with exactly: OK",
+            max_output_tokens=5,
+        )
+        text = (response.output_text or "").strip()
+        print(f"GENERATION_DIAGNOSTIC_OK model={model_name} request_id={getattr(response, '_request_id', None)} output={text!r}", flush=True)
+        return JSONResponse({
+            "status": "ok",
+            "message": "Real Responses API generation succeeded.",
+            "model": model_name,
+            "output": text,
+            "request_id": getattr(response, "_request_id", None),
+        })
+    except Exception as e:
+        print(f"GENERATION_DIAGNOSTIC_ERROR type={type(e).__name__} message={e}", flush=True)
+        return JSONResponse({
+            "status": "failed",
+            "error_type": type(e).__name__,
+            "message": str(e),
+            "model": model_name,
+        }, status_code=502)
+
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.2.2"}
+def health(): return {"status":"ok","version":"0.2.3"}
 
 
 init()
