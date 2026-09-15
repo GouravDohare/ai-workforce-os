@@ -5,7 +5,7 @@ from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
 DB = Path(__file__).with_name("workforce_v02.db")
-app = FastAPI(title="AI Workforce OS", version="0.2.2")
+app = FastAPI(title="AI Workforce OS", version="0.2.1")
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def uid(): return str(uuid.uuid4())
@@ -161,96 +161,7 @@ def api_goal(gid:str):
     ts=fetch("SELECT * FROM tasks WHERE goal_id=?",(gid,))
     return {"goal":dict(g[0]),"tasks":[dict(t) for t in ts]}
 
-@app.get("/diagnostics/openai", response_class=JSONResponse)
-def diagnostics_openai():
-    """Test OpenAI authentication/network without making a model-generation request."""
-    key = os.getenv("OPENAI_API_KEY")
-    model_name = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-    if not key:
-        return JSONResponse({
-            "status": "failed",
-            "error_type": "ConfigurationError",
-            "message": "OPENAI_API_KEY is not configured",
-            "model": model_name,
-            "key_present": False,
-        }, status_code=500)
-
-    try:
-        from openai import OpenAI
-        print(f"OPENAI_DIAGNOSTIC_START model={model_name}", flush=True)
-        client = OpenAI(api_key=key, timeout=15.0, max_retries=0)
-
-        # Listing models authenticates with the API and checks outbound connectivity
-        # without generating text and therefore without making a normal model request.
-        page = client.models.list()
-        model_ids = {getattr(m, "id", "") for m in page.data}
-        configured_model_available = model_name in model_ids
-
-        result = {
-            "status": "ok",
-            "message": "OpenAI API is reachable and the API key authenticated successfully.",
-            "model": model_name,
-            "key_present": True,
-            "configured_model_available": configured_model_available,
-            "models_visible": len(model_ids),
-        }
-        if not configured_model_available:
-            result["note"] = "The API connection works, but the configured model was not present in the returned model list."
-        print(f"OPENAI_DIAGNOSTIC_OK model={model_name} configured_model_available={configured_model_available}", flush=True)
-        return JSONResponse(result)
-
-    except Exception as e:
-        print(f"OPENAI_DIAGNOSTIC_ERROR type={type(e).__name__} message={e}", flush=True)
-        return JSONResponse({
-            "status": "failed",
-            "error_type": type(e).__name__,
-            "message": str(e),
-            "model": model_name,
-            "key_present": True,
-        }, status_code=502)
-
-@app.get("/diagnostics/generation", response_class=JSONResponse)
-def diagnostics_generation():
-    """Make exactly one tiny real Responses API generation request."""
-    key = os.getenv("OPENAI_API_KEY")
-    model_name = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-    if not key:
-        return JSONResponse({
-            "status": "failed",
-            "error_type": "ConfigurationError",
-            "message": "OPENAI_API_KEY is not configured",
-            "model": model_name,
-        }, status_code=500)
-
-    try:
-        from openai import OpenAI
-        print(f"GENERATION_DIAGNOSTIC_START model={model_name}", flush=True)
-        client = OpenAI(api_key=key, timeout=60.0, max_retries=0)
-        response = client.responses.create(
-            model=model_name,
-            input="Reply with exactly: OK",
-            max_output_tokens=16,
-        )
-        text = (response.output_text or "").strip()
-        print(f"GENERATION_DIAGNOSTIC_OK model={model_name} request_id={getattr(response, '_request_id', None)} output={text!r}", flush=True)
-        return JSONResponse({
-            "status": "ok",
-            "message": "Real Responses API generation succeeded.",
-            "model": model_name,
-            "output": text,
-            "request_id": getattr(response, "_request_id", None),
-        })
-    except Exception as e:
-        print(f"GENERATION_DIAGNOSTIC_ERROR type={type(e).__name__} message={e}", flush=True)
-        return JSONResponse({
-            "status": "failed",
-            "error_type": type(e).__name__,
-            "message": str(e),
-            "model": model_name,
-        }, status_code=502)
-
 @app.get("/health")
-def health(): return {"status":"ok","version":"0.2.3"}
-
+def health(): return {"status":"ok","version":"0.2.1"}
 
 init()
