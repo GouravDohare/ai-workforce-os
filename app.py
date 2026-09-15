@@ -229,7 +229,7 @@ def diagnostics_generation():
         response = client.responses.create(
             model=model_name,
             input="Reply with exactly: OK",
-            max_output_tokens=5,
+            max_output_tokens=16,
         )
         text = (response.output_text or "").strip()
         print(f"GENERATION_DIAGNOSTIC_OK model={model_name} request_id={getattr(response, '_request_id', None)} output={text!r}", flush=True)
