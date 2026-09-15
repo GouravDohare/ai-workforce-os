@@ -8,7 +8,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-APP_VERSION = "0.3.5"
+APP_VERSION = "0.3.7"
 SCHEMA_VERSION = "035-6"
 DB = Path(__file__).with_name("workforce_v035.db")
 MAX_TASKS = int(os.getenv("MAX_TASKS_PER_GOAL", "10"))
@@ -195,6 +195,24 @@ def parse_structured_text(text):
         raise ValueError(f"Structured response must be a JSON object, got {type(value).__name__}")
     return value
 
+def response_text(resp):
+    """Return model text even when SDK output_text is empty but message content exists."""
+    text=(getattr(resp,"output_text","") or "").strip()
+    if text:
+        return text
+    chunks=[]
+    try:
+        for item in getattr(resp,"output",[]) or []:
+            for part in getattr(item,"content",[]) or []:
+                value=getattr(part,"text",None)
+                if isinstance(value,str) and value.strip():
+                    chunks.append(value.strip())
+                elif hasattr(value,"value") and str(value.value).strip():
+                    chunks.append(str(value.value).strip())
+    except Exception:
+        pass
+    return "\n\n".join(chunks).strip()
+
 def citations(resp):
     out=[]
     try:
@@ -268,16 +286,17 @@ def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,str
             client=OpenAI(api_key=key,timeout=OPENAI_TIMEOUT,max_retries=0)
             kwargs={"model":model,"input":f"SYSTEM:\n{system}\n\nUSER:\n{prompt}","max_output_tokens":max_output_tokens}
             if web: kwargs["tools"]=[{"type":"web_search"}]
-            if structured_schema: kwargs["text"]={"format":{"type":"json_schema","name":structured_schema["name"],"strict":True,"schema":structured_schema["schema"]}}
+            request_schema = None if web else structured_schema
+            if request_schema: kwargs["text"]={"format":{"type":"json_schema","name":request_schema["name"],"strict":True,"schema":request_schema["schema"]}}
             resp=client.responses.create(**kwargs)
-            text=(getattr(resp,"output_text","") or "").strip()
+            text=response_text(resp)
             if not text: raise RuntimeError("Model returned empty output")
             inp,out=usage_counts(resp); cost=calc_cost(model,inp,out); lat=int((time.time()-started)*1000); req=response_id(resp); cites=citations(resp)
             meta.update({"citations":cites,"request_id":req})
             # Parse structured output before declaring the call successful. The model may have
             # completed while the application-level contract validation failed.
             try:
-                structured = parse_structured_text(text) if structured_schema else None
+                structured = parse_structured_text(text) if request_schema else None
             except Exception as parse_exc:
                 meta.update({"validation_error":str(parse_exc)})
                 write("UPDATE model_calls SET ended_at=?,latency_ms=?,input_tokens=?,output_tokens=?,cost=?,request_id=?,status='failed',error_type='structured_output_validation',error_message=?,metadata_json=? WHERE id=?",(now(),lat,inp,out,cost,req,str(parse_exc),json.dumps(meta),call_id))
@@ -300,7 +319,8 @@ def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,str
                 write("UPDATE budget_reservations SET status='released',updated_at=? WHERE id=?",(now(),reservation))
                 reservation=None
             if web and attempt==1:
-                web=False; log_event(run_id=run_id,goal_id=goal["id"] if goal else None,task_id=task_id,kind="tool_fallback",message="Retrying without web search.")
+                log_event(run_id=run_id,goal_id=goal["id"] if goal else None,task_id=task_id,kind="web_retry",message="Retrying the research call with web search enabled.")
+                time.sleep(1)
                 continue
             if cls.startswith("transient") and attempt<max_attempts:
                 time.sleep(min(2**(attempt-1),4)); continue
@@ -662,10 +682,23 @@ def run_task(run_id,task_id):
             if wants_web and not tool_allowed(agent, "web_search"):
                 log_event(run_id=run_id, goal_id=goal["id"], task_id=task_id, kind="capability_gap", message="Task requested web search but assigned agent lacks web_research capability.")
                 wants_web = False
-            result=call_model(run_id,task_id,task["agent_instance_id"],system,prompt,purpose="task",use_web=wants_web,structured_schema=task_output_schema(),max_output_tokens=1500,max_attempts=1)
+            result=call_model(run_id,task_id,task["agent_instance_id"],system,prompt,purpose="task",use_web=wants_web,structured_schema=None if wants_web else task_output_schema(),max_output_tokens=1800 if wants_web else 1500,max_attempts=1)
             data=result["structured"]
+            if wants_web and not isinstance(data,dict):
+                raw=result["text"].strip()
+                urls=re.findall(r"https?://[^\s)\]}>]+", raw)
+                cited_facts=[f"Source: {c.get('title') or c.get('url')} - {c.get('url')}" for c in result.get("citations",[]) if c.get("url")]
+                cited_facts += [f"Source URL: {u.rstrip('.,') }" for u in urls if u.rstrip('.,') not in [c.get("url") for c in result.get("citations",[])]]
+                data={"summary":raw[:6000],"facts":cited_facts[:20],"assumptions":[],"unknowns":[],"claims":[],"recommendations":[]}
             if not isinstance(data,dict): raise ValueError("Task structured output is not an object")
-            eids=add_evidence(run_id,task_id,result["citations"]);conf=confidence_from(data,len(eids));aid=create_artifact(run_id,task_id,f"{task['title']} â work output",result["text"])
+            cite_list=list(result.get("citations",[]))
+            known_urls={c.get("url") for c in cite_list if c.get("url")}
+            if wants_web:
+                for u in re.findall(r"https?://[^\s)\]}>]+", result["text"]):
+                    u=u.rstrip(".,")
+                    if u not in known_urls:
+                        cite_list.append({"title":"Source URL from research output","url":u,"publisher":"","published_at":""});known_urls.add(u)
+            eids=add_evidence(run_id,task_id,cite_list);conf=confidence_from(data,len(eids));aid=create_artifact(run_id,task_id,f"{task['title']} - work output",result["text"])
             aended=result.get("ended_at") or now()
             write("INSERT INTO task_attempts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(uid(),task_id,attempt,"completed",result["model"],result.get("started_at",attempt_started_iso),aended,result["latency_ms"],result["input_tokens"],result["output_tokens"],result["cost"],result.get("request_id"),None,json.dumps({"strategy":"primary","request_id":result.get("request_id"),"web":wants_web}),now()))
             write("UPDATE tasks SET status='completed',attempt_count=?,output=?,structured_output_json=?,confidence=?,updated_at=?,error_type=NULL,error_message=NULL WHERE id=?",(attempt,result["text"],json.dumps(data),conf,now(),task_id));write("UPDATE agent_instances SET status='idle',updated_at=? WHERE id=?",(now(),task["agent_instance_id"]))
@@ -827,7 +860,7 @@ def execute_goal(gid):
 
 
 @app.get("/login",response_class=HTMLResponse)
-def login():return "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><h1>AI Workforce OS</h1><form method='post'><input name=token type=password placeholder='Access token' required><button>Sign in</button></form>"
+def login():return "<!doctype html><meta charset='utf-8'><meta name=viewport content='width=device-width,initial-scale=1'><h1>AI Workforce OS</h1><form method='post'><input name=token type=password placeholder='Access token' required><button>Sign in</button></form>"
 @app.post("/login")
 def login_post(token:str=Form(...)):
     if not APP_ACCESS_TOKEN or not hmac.compare_digest(token,APP_ACCESS_TOKEN):return HTMLResponse("Invalid token",status_code=401)
@@ -838,9 +871,9 @@ def home(request:Request):
     denied=require_auth(request)
     if denied:return denied
     goals=fetch("SELECT * FROM goals ORDER BY created_at DESC");agents=fetch("SELECT * FROM agent_profiles ORDER BY role")
-    gh="".join(f"<div class=row><a href='/goals/{g['id']}'><b>{esc(g['title'])}</b></a> Â· {esc(g['status'])} Â· ${g['spent']:.4f}/${g['budget']:.2f} Â· replans {g['replan_count']}</div>" for g in goals) or "<p>No objectives yet.</p>"
+    gh="".join(f"<div class=row><a href='/goals/{g['id']}'><b>{esc(g['title'])}</b></a> &middot; {esc(g['status'])} &middot; ${g['spent']:.4f}/${g['budget']:.2f} &middot; replans {g['replan_count']}</div>" for g in goals) or "<p>No objectives yet.</p>"
     ah="".join(f"<div class=card><b>{esc(a['name'])}</b><div class=muted>{esc(a['role'])}</div><p>{esc(a['instructions'])}</p></div>" for a in agents)
-    return f"""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>AI Workforce OS</title><style>body{{margin:0;background:#f3f5f7;font-family:-apple-system,system-ui}}main{{max-width:1100px;margin:auto;padding:18px}}section,.card{{background:#fff;border:1px solid #dfe3e7;border-radius:14px;padding:16px;margin:12px 0}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}input,textarea,button{{width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:9px;font:inherit}}textarea{{min-height:100px}}button{{background:#111;color:#fff;border:0;font-weight:700}}.row{{padding:10px 0;border-bottom:1px solid #eee}}.muted{{color:#69717c;font-size:.9em}}a{{color:#145ac6;text-decoration:none}}@media(max-width:700px){{.grid{{grid-template-columns:1fr}}}}</style><main><h1>AI WORKFORCE OS <small>{APP_VERSION}</small></h1><div class=grid><section><h2>Give the company an objective</h2><form method=post action=/goals><input name=title placeholder='Objective title' required><textarea name=description placeholder='Describe what you want the company to accomplish.' required></textarea><textarea name=criteria placeholder='What does success look like?' required></textarea><label class=muted for=budget>Budget (USD) â optional; leave blank to use the system safety budget</label><input id=budget name=budget type=number min=0 step=.01 placeholder='e.g. 5.00'><button>Create objective</button></form></section><section><h2>Objectives</h2>{gh}</section></div><section><h2>Workforce profiles</h2><div class=cards>{ah}</div></section></main>"""
+    return f"""<!doctype html><meta charset='utf-8'><meta name=viewport content='width=device-width,initial-scale=1'><title>AI Workforce OS</title><style>body{{margin:0;background:#f4f6f8;color:#111;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}main{{max-width:1160px;margin:auto;padding:28px 20px 48px}}.top{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:18px}}h1{{font-size:34px;letter-spacing:-.8px;margin:0}}h1 small{{font-size:.55em;color:#59636e;font-weight:700}}h2{{margin-top:0;font-size:22px}}section,.card{{background:#fff;border:1px solid #dfe3e8;border-radius:16px;box-shadow:0 1px 2px rgba(16,24,40,.04);padding:18px}}.grid{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}}.card{{min-height:118px}}input,textarea,button{{width:100%;box-sizing:border-box;padding:12px 13px;margin:7px 0;border-radius:10px;font:inherit}}input,textarea{{border:1px solid #cbd2d9;background:#fff}}input:focus,textarea:focus{{outline:2px solid #c7d8ff;border-color:#5b8def}}textarea{{min-height:102px;resize:vertical}}button{{background:#111;color:#fff;border:0;font-weight:700;cursor:pointer}}button:hover{{background:#222}}.row{{padding:11px 0;border-bottom:1px solid #eceff2}}.muted{{color:#69717c;font-size:.92em}}a{{color:#145ac6;text-decoration:none}}a:hover{{text-decoration:underline}}.label{{display:block;margin-top:5px}}@media(max-width:760px){{main{{padding:18px 12px 36px}}.grid{{grid-template-columns:1fr}}h1{{font-size:28px}}}}@media(min-width:1000px){{.card{{min-height:120px}}}}</style><main><div class=top><h1>AI WORKFORCE OS <small>{APP_VERSION}</small></h1></div><div class=grid><section><h2>Give the company an objective</h2><form method=post action=/goals><input name=title placeholder='Objective title' required><textarea name=description placeholder='Describe what you want the company to accomplish.' required></textarea><textarea name=criteria placeholder='What does success look like?' required></textarea><label class=muted for=budget>Budget (USD) - optional; leave blank to use the system safety budget</label><input id=budget name=budget type=number min=0 step=.01 placeholder='e.g. 5.00'><button>Create objective</button></form></section><section><h2>Objectives</h2>{gh}</section></div><section><h2>Workforce profiles</h2><div class=cards>{ah}</div></section></main>"""
 
 @app.post("/goals")
 def create_goal(request:Request,title:str=Form(...),description:str=Form(...),criteria:str=Form(...),budget:Optional[float]=Form(None)):
@@ -875,14 +908,14 @@ def detail(request:Request,gid:str):
     evs=fetch("SELECT * FROM evaluations WHERE run_id=? ORDER BY created_at DESC",(g["current_run_id"],)) if g["current_run_id"] else []
     sources=fetch("SELECT * FROM evidence WHERE run_id=? ORDER BY created_at DESC LIMIT 40",(g["current_run_id"],)) if g["current_run_id"] else []
     events=fetch("SELECT * FROM events WHERE goal_id=? ORDER BY created_at DESC LIMIT 80",(gid,))
-    th="".join(f"<details><summary><b>{esc(t['title'])}</b> â {esc(t['agent_name'])} Â· {esc(t['status'])} Â· confidence {esc(t['confidence'])}</summary><p class=muted>attempts={t['attempt_count']} Â· spend=${t['spent']:.4f} Â· budget=${t['budget_limit']:.4f}</p><pre>{esc(t['output'] or t['error_message'] or '')}</pre></details>" for t in ts) or "<p>Tasks will appear.</p>"
+    th="".join(f"<details><summary><b>{esc(t['title'])}</b> â {esc(t['agent_name'])} &middot; {esc(t['status'])} &middot; confidence {esc(t['confidence'])}</summary><p class=muted>attempts={t['attempt_count']} &middot; spend=${t['spent']:.4f} &middot; budget=${t['budget_limit']:.4f}</p><pre>{esc(t['output'] or t['error_message'] or '')}</pre></details>" for t in ts) or "<p>Tasks will appear.</p>"
     hh="".join(f"<div class=row><b>{esc(h['from_name'])}</b> â <b>{esc(h['to_name'])}</b><pre>{esc(h['summary'])}</pre><div class=muted>assumptions: {esc(h['assumptions_json'])}<br>unknowns: {esc(h['unknowns_json'])}</div></div>" for h in hs) or "<p>No handoffs recorded.</p>"
-    eh="".join(f"<div class=row><b>{('not evaluated' if e['score'] is None else f'{e["score"]:.2f}')}</b> Â· {'PASS' if e['passed'] else 'FAIL'}<pre>{esc(e['failures_json'])}</pre></div>" for e in evs) or "<p>No evaluation yet.</p>"
+    eh="".join(f"<div class=row><b>{('not evaluated' if e['score'] is None else f'{e["score"]:.2f}')}</b> &middot; {'PASS' if e['passed'] else 'FAIL'}<pre>{esc(e['failures_json'])}</pre></div>" for e in evs) or "<p>No evaluation yet.</p>"
     sh="".join(f"<div class=row><a href='{esc(s['source_url'])}' target=_blank>{esc(s['source_title'] or s['source_url'])}</a></div>" for s in sources if s['source_url']) or "<p>No captured sources.</p>"
     ac="".join(f"<div class=row><small>{esc(e['created_at'][11:19])}</small> {esc(e['message'])}</div>" for e in events)
     retry=f"<form method=post action='/goals/{gid}/retry'><button>Retry goal</button></form>" if g['status'] in ('failed','incomplete','interrupted','verification_failed') else ""
     refresh="<script>setTimeout(()=>location.reload(),4000)</script>" if g['status'] in ('queued','planning','executing') else ""
-    return f"""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>{esc(g['title'])}</title><style>body{{margin:0;background:#f3f5f7;font-family:-apple-system,system-ui}}main{{max-width:1000px;margin:auto;padding:18px}}section{{background:#fff;border:1px solid #dfe3e7;border-radius:14px;padding:16px;margin:14px 0}}pre{{white-space:pre-wrap;background:#f7f8fa;padding:12px;border-radius:9px;overflow:auto}}.row{{padding:10px 0;border-bottom:1px solid #eee}}button{{width:100%;padding:11px;background:#111;color:#fff;border:0;border-radius:9px;font-weight:700}}a{{color:#145ac6;text-decoration:none}}.muted{{color:#69717c;font-size:.9em}}</style><main><a href='/'>â Workforce dashboard</a><h1>{esc(g['title'])}</h1><section><b>Version:</b> {APP_VERSION} Â· <b>Status:</b> {esc(g['status'])}<br><b>Budget:</b> ${g['spent']:.4f}/${g['budget']:.2f} Â· <b>Replans:</b> {g['replan_count']}/{g['max_replans']}</section>{retry}<section><h2>CEO plan</h2><pre>{esc(g['plan_json'] or 'Planning in progress...')}</pre></section><section><h2>Task execution</h2>{th}</section><section><h2>Evaluator</h2>{eh}</section><section><h2>Agent handoffs</h2>{hh}</section><section><h2>Evidence / sources</h2>{sh}</section><section><h2>Final output</h2><pre>{esc(g['final_output'] or 'Verification/report in progress...')}</pre></section><section><h2>Activity</h2>{ac}</section></main>{refresh}"""
+    return f"""<!doctype html><meta charset='utf-8'><meta name=viewport content='width=device-width,initial-scale=1'><title>{esc(g['title'])}</title><style>body{{margin:0;background:#f4f6f8;color:#111;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}main{{max-width:1040px;margin:auto;padding:24px 18px 48px}}section{{background:#fff;border:1px solid #dfe3e8;border-radius:16px;box-shadow:0 1px 2px rgba(16,24,40,.04);padding:18px;margin:14px 0}}h1{{font-size:30px;letter-spacing:-.5px}}pre{{white-space:pre-wrap;background:#f7f8fa;border:1px solid #eceff2;padding:13px;border-radius:10px;overflow:auto;line-height:1.45}}.row{{padding:11px 0;border-bottom:1px solid #eceff2}}button{{width:100%;padding:12px;background:#111;color:#fff;border:0;border-radius:10px;font-weight:700}}a{{color:#145ac6;text-decoration:none}}a:hover{{text-decoration:underline}}.muted{{color:#69717c;font-size:.9em}}details{{border-bottom:1px solid #eceff2;padding:10px 0}}summary{{cursor:pointer}}@media(max-width:760px){{main{{padding:18px 12px 36px}}h1{{font-size:26px}}}}</style><main><a href='/'>&larr; Workforce dashboard</a><h1>{esc(g['title'])}</h1><section><b>Version:</b> {APP_VERSION} &middot; <b>Status:</b> {esc(g['status'])}<br><b>Budget:</b> ${g['spent']:.4f}/${g['budget']:.2f} &middot; <b>Replans:</b> {g['replan_count']}/{g['max_replans']}</section>{retry}<section><h2>CEO plan</h2><pre>{esc(g['plan_json'] or 'Planning in progress...')}</pre></section><section><h2>Task execution</h2>{th}</section><section><h2>Evaluator</h2>{eh}</section><section><h2>Agent handoffs</h2>{hh}</section><section><h2>Evidence / sources</h2>{sh}</section><section><h2>Final output</h2><pre>{esc(g['final_output'] or 'Verification/report in progress...')}</pre></section><section><h2>Activity</h2>{ac}</section></main>{refresh}"""
 
 @app.get("/api/goals/{gid}")
 def api_goal(request:Request,gid:str):
