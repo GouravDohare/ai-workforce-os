@@ -8,7 +8,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-APP_VERSION = "0.3.9"
+APP_VERSION = "0.3.10"
 SCHEMA_VERSION = "035-7"
 DB = Path(__file__).with_name("workforce_v035.db")
 MAX_TASKS = int(os.getenv("MAX_TASKS_PER_GOAL", "10"))
@@ -265,7 +265,7 @@ def settle_budget(reservation_id,actual,goal_id,task_id,agent_id,call_id):
     finally:c.close()
 
 
-def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,structured_schema=None,max_output_tokens=6000,max_attempts=2):
+def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,structured_schema=None,max_output_tokens=6000,max_attempts=2,reasoning_effort=None):
     key=os.getenv("OPENAI_API_KEY")
     if not key: raise RuntimeError("OPENAI_API_KEY is not configured")
     from openai import OpenAI
@@ -286,6 +286,8 @@ def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,str
             client=OpenAI(api_key=key,timeout=OPENAI_TIMEOUT,max_retries=0)
             kwargs={"model":model,"input":f"SYSTEM:\n{system}\n\nUSER:\n{prompt}","max_output_tokens":max_output_tokens}
             if web: kwargs["tools"]=[{"type":"web_search"}]
+            if reasoning_effort:
+                kwargs["reasoning"]={"effort": reasoning_effort}
             request_schema = None if web else structured_schema
             if request_schema: kwargs["text"]={"format":{"type":"json_schema","name":request_schema["name"],"strict":True,"schema":request_schema["schema"]}}
             resp=client.responses.create(**kwargs)
@@ -975,12 +977,15 @@ def diagnostics_generation(request:Request):
     if denied:return denied
     key=os.getenv("OPENAI_API_KEY");model=os.getenv("OPENAI_MODEL","gpt-5-mini")
     if not key:return JSONResponse({"status":"failed","error_type":"ConfigurationError","message":"OPENAI_API_KEY is not configured","model":model},500)
-    limit=1024
+    # This endpoint is a health check, not an intelligence benchmark. Keep reasoning
+    # deliberately minimal so a tiny "OK" cannot consume the entire output budget.
+    limit=4096
+    reasoning_effort="minimal"
     try:
-        r=call_model(None,None,None,"Reply exactly with OK.","Reply exactly with: OK",purpose="diagnostic",max_output_tokens=limit,max_attempts=1)
-        return {"status":"ok","message":"Real Responses API generation succeeded.","version":APP_VERSION,"model":r["model"],"output":r["text"],"latency_ms":r["latency_ms"],"max_output_tokens":limit}
+        r=call_model(None,None,None,"Reply exactly with OK.","Reply exactly with: OK",purpose="diagnostic",max_output_tokens=limit,max_attempts=1,reasoning_effort=reasoning_effort)
+        return {"status":"ok","message":"Real Responses API generation succeeded.","version":APP_VERSION,"model":r["model"],"output":r["text"],"latency_ms":r["latency_ms"],"max_output_tokens":limit,"reasoning_effort":reasoning_effort}
     except Exception as exc:
-        return JSONResponse({"status":"failed","error_type":type(exc).__name__,"message":str(exc),"version":APP_VERSION,"model":model,"max_output_tokens":limit},502)
+        return JSONResponse({"status":"failed","error_type":type(exc).__name__,"message":str(exc),"version":APP_VERSION,"model":model,"max_output_tokens":limit,"reasoning_effort":reasoning_effort},502)
 
 @app.post("/benchmarks/start")
 def benchmark_start(request: Request, case_name: str = Form(...), expected_version: str = Form(...)):
