@@ -8,7 +8,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-APP_VERSION = "0.3.7"
+APP_VERSION = "0.3.8"
 SCHEMA_VERSION = "035-6"
 DB = Path(__file__).with_name("workforce_v035.db")
 MAX_TASKS = int(os.getenv("MAX_TASKS_PER_GOAL", "10"))
@@ -265,7 +265,7 @@ def settle_budget(reservation_id,actual,goal_id,task_id,agent_id,call_id):
     finally:c.close()
 
 
-def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,structured_schema=None,max_output_tokens=1600,max_attempts=2):
+def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,structured_schema=None,max_output_tokens=4000,max_attempts=2):
     key=os.getenv("OPENAI_API_KEY")
     if not key: raise RuntimeError("OPENAI_API_KEY is not configured")
     from openai import OpenAI
@@ -290,7 +290,11 @@ def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,str
             if request_schema: kwargs["text"]={"format":{"type":"json_schema","name":request_schema["name"],"strict":True,"schema":request_schema["schema"]}}
             resp=client.responses.create(**kwargs)
             text=response_text(resp)
-            if not text: raise RuntimeError("Model returned empty output")
+            response_status=str(getattr(resp,"status","") or "")
+            incomplete=getattr(resp,"incomplete_details",None)
+            if not text:
+                detail=str(incomplete) if incomplete else "no visible output text"
+                raise RuntimeError(f"Model returned empty output (status={response_status or 'unknown'}; {detail})")
             inp,out=usage_counts(resp); cost=calc_cost(model,inp,out); lat=int((time.time()-started)*1000); req=response_id(resp); cites=citations(resp)
             meta.update({"citations":cites,"request_id":req})
             # Parse structured output before declaring the call successful. The model may have
@@ -319,7 +323,7 @@ def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,str
                 write("UPDATE budget_reservations SET status='released',updated_at=? WHERE id=?",(now(),reservation))
                 reservation=None
             if web and attempt==1:
-                log_event(run_id=run_id,goal_id=goal["id"] if goal else None,task_id=task_id,kind="web_retry",message="Retrying the research call with web search enabled.")
+                log_event(run_id=run_id,goal_id=goal["id"] if goal else None,task_id=task_id,kind="web_retry",message="Retrying the web research call.")
                 time.sleep(1)
                 continue
             if cls.startswith("transient") and attempt<max_attempts:
@@ -575,7 +579,7 @@ def make_plan(run_id,g):
     system="""You are the CEO of an AI workforce. Build the smallest sufficient workforce and task graph for the user's objective. Return ONLY the compact schema-defined JSON object. Choose specialist roles and task dependencies; do not generate long contracts, budgets, retry policies or verification boilerplate because the application adds those. Preserve explicit user requirements. If the objective requires current external information, research, market facts, competitors, sources or evidence, assign a research task with requires_web=true. Never silently disable a required capability. If requirements conflict, represent the conflict in task instructions rather than inventing facts."""
     prompt=f"Objective: {g['title']}\nDescription: {g['description']}\nSuccess criteria: {g['criteria']}"
     try:
-        r=call_model(run_id,None,None,system,prompt,purpose="planner",structured_schema=plan_schema(),max_output_tokens=1200,max_attempts=2)
+        r=call_model(run_id,None,None,system,prompt,purpose="planner",structured_schema=plan_schema(),max_output_tokens=2400,max_attempts=2)
         plan=r["structured"]
         if not isinstance(plan,dict) or not plan.get("tasks"):
             raise ValueError("Planner returned an unusable structured plan")
@@ -682,7 +686,7 @@ def run_task(run_id,task_id):
             if wants_web and not tool_allowed(agent, "web_search"):
                 log_event(run_id=run_id, goal_id=goal["id"], task_id=task_id, kind="capability_gap", message="Task requested web search but assigned agent lacks web_research capability.")
                 wants_web = False
-            result=call_model(run_id,task_id,task["agent_instance_id"],system,prompt,purpose="task",use_web=wants_web,structured_schema=None if wants_web else task_output_schema(),max_output_tokens=1800 if wants_web else 1500,max_attempts=1)
+            result=call_model(run_id,task_id,task["agent_instance_id"],system,prompt,purpose="task",use_web=wants_web,structured_schema=None if wants_web else task_output_schema(),max_output_tokens=5000 if wants_web else 2400,max_attempts=1)
             data=result["structured"]
             if wants_web and not isinstance(data,dict):
                 raw=result["text"].strip()
@@ -774,7 +778,7 @@ def evaluate(run_id):
     g=get_goal_from_run(run_id);vp=json.loads(g["verification_plan_json"] or "{}");threshold=float(vp.get("pass_threshold",.8))
     system="""You are an independent evaluator. Judge the actual workforce record against the user's success criteria. Check completeness, evidence, assumptions/unknowns, contradictions, numerical integrity, risk and actionability. A fluent answer is not enough. Return only the required JSON."""
     prompt=f"Objective: {g['title']}\nDescription: {g['description']}\nSuccess criteria: {g['criteria']}\nThreshold: {threshold}\nWorkforce record:\n{evaluation_context(run_id)}"
-    try:r=call_model(run_id,None,None,system,prompt,purpose="evaluator",structured_schema=evaluator_schema(),max_output_tokens=1500,max_attempts=3)
+    try:r=call_model(run_id,None,None,system,prompt,purpose="evaluator",structured_schema=evaluator_schema(),max_output_tokens=2400,max_attempts=3)
     except Exception as exc:
         log_event(run_id=run_id,goal_id=g["id"],kind="evaluator_failure",message=f"Evaluator service failed: {type(exc).__name__}: {exc}",payload={"error_type":classify_error(exc)})
         return {"service_failed":True,"passed":False,"score":None,"failures":["Evaluator service unavailable"],"replan_tasks":[],"contradictions":[]}
@@ -821,7 +825,7 @@ def execute_report(run_id):
     if any(d["required"] and not dep_satisfied(d) for d in deps(run_id,report["id"])):return False,"Report blocked by dependency."
     system="You are the executive report writer. Use only the verified workforce record. Produce a decision-ready report with facts/evidence, assumptions, unknowns, contradictions, risks, recommendations and next actions. Do not invent evidence."
     prompt=f"Objective: {g['title']}\nDescription: {g['description']}\nSuccess criteria: {g['criteria']}\nVerified record:\n{evaluation_context(run_id)}"
-    try:r=call_model(run_id,report["id"],report["agent_instance_id"],system,prompt,purpose="report",structured_schema=None,max_output_tokens=2200,max_attempts=2)
+    try:r=call_model(run_id,report["id"],report["agent_instance_id"],system,prompt,purpose="report",structured_schema=None,max_output_tokens=4000,max_attempts=2)
     except Exception as exc:
         write("UPDATE tasks SET status='failed',error_type=?,error_message=?,updated_at=? WHERE id=?",(classify_error(exc),str(exc),now(),report["id"]));return False,str(exc)
     eids=add_evidence(run_id,report["id"],r["citations"]);aid=create_artifact(run_id,report["id"],"Final executive report",r["text"])
@@ -858,6 +862,41 @@ def execute_goal(gid):
         write("UPDATE agent_instances SET status='idle',updated_at=? WHERE status='working'",(now(),))
         with future_lock:goal_futures.pop(gid,None)
 
+
+
+def recover_interrupted_runs():
+    """Convert process-local active work into explicit interrupted state after a restart.
+
+    The prototype executor is in-memory. If Render restarts while a goal is running,
+    SQLite can otherwise leave tasks looking like they are still running forever.
+    """
+    active=fetch("SELECT id FROM goals WHERE status IN ('queued','planning','executing')")
+    for g in active:
+        gid=g["id"]
+        rid_row=fetch_one("SELECT id FROM runs WHERE goal_id=? AND status IN ('planning','executing') ORDER BY created_at DESC LIMIT 1",(gid,))
+        if not rid_row:
+            continue
+        rid=rid_row["id"]
+        write("UPDATE tasks SET status='interrupted',error_type='process_restart',error_message='Process restarted while this task was active.',updated_at=? WHERE run_id=? AND status IN ('running','retrying','ready','waiting_dependency','pending')",(now(),rid))
+        write("UPDATE agent_instances SET status='idle',updated_at=? WHERE run_id=? AND status='working'",(now(),rid))
+        write("UPDATE runs SET status='interrupted',ended_at=?,reason=? WHERE id=?",(now(),"Process restarted before the in-memory executor could finish.",rid))
+        write("UPDATE goals SET status='interrupted',final_output=?,updated_at=? WHERE id=?",("INTERRUPTED: the worker process restarted before this run finished. Retry the goal to continue.",now(),gid))
+        log_event(run_id=rid,goal_id=gid,kind='process_recovery',message='Marked active run interrupted after process restart.')
+
+
+
+@app.get("/diagnostics/web")
+def diagnostics_web(request:Request):
+    denied=require_auth(request)
+    if denied:return denied
+    try:
+        r=call_model(None,None,None,
+            "You are a web-search diagnostic agent. Use the web search tool and return a short factual answer with source links.",
+            "Search the web for the current official OpenAI API documentation page for the Responses API. Return the page title and URL.",
+            purpose="diagnostic",use_web=True,max_output_tokens=1500,max_attempts=1)
+        return {"status":"ok","message":"Real Responses API web search succeeded.","version":APP_VERSION,"model":r["model"],"output":r["text"],"citations":r.get("citations",[]),"latency_ms":r["latency_ms"]}
+    except Exception as exc:
+        return JSONResponse({"status":"failed","error_type":type(exc).__name__,"message":str(exc),"version":APP_VERSION,"model":os.getenv("OPENAI_MODEL","gpt-5-mini")},502)
 
 @app.get("/login",response_class=HTMLResponse)
 def login():return "<!doctype html><meta charset='utf-8'><meta name=viewport content='width=device-width,initial-scale=1'><h1>AI Workforce OS</h1><form method='post'><input name=token type=password placeholder='Access token' required><button>Sign in</button></form>"
@@ -908,14 +947,14 @@ def detail(request:Request,gid:str):
     evs=fetch("SELECT * FROM evaluations WHERE run_id=? ORDER BY created_at DESC",(g["current_run_id"],)) if g["current_run_id"] else []
     sources=fetch("SELECT * FROM evidence WHERE run_id=? ORDER BY created_at DESC LIMIT 40",(g["current_run_id"],)) if g["current_run_id"] else []
     events=fetch("SELECT * FROM events WHERE goal_id=? ORDER BY created_at DESC LIMIT 80",(gid,))
-    th="".join(f"<details><summary><b>{esc(t['title'])}</b> â {esc(t['agent_name'])} &middot; {esc(t['status'])} &middot; confidence {esc(t['confidence'])}</summary><p class=muted>attempts={t['attempt_count']} &middot; spend=${t['spent']:.4f} &middot; budget=${t['budget_limit']:.4f}</p><pre>{esc(t['output'] or t['error_message'] or '')}</pre></details>" for t in ts) or "<p>Tasks will appear.</p>"
-    hh="".join(f"<div class=row><b>{esc(h['from_name'])}</b> â <b>{esc(h['to_name'])}</b><pre>{esc(h['summary'])}</pre><div class=muted>assumptions: {esc(h['assumptions_json'])}<br>unknowns: {esc(h['unknowns_json'])}</div></div>" for h in hs) or "<p>No handoffs recorded.</p>"
+    th="".join(f"<details><summary><b>{esc(t['title'])}</b> - {esc(t['agent_name'])} | {esc(t['status'])} | confidence {esc(t['confidence'] if t['confidence'] is not None else "-")}</summary><p class=muted>attempts={t['attempt_count']} | spend=${t['spent']:.4f} | budget=${t['budget_limit']:.4f}</p><pre>{esc(t['output'] or t['error_message'] or '')}</pre></details>" for t in ts) or "<p>Tasks will appear.</p>"
+    hh="".join(f"<div class=row><b>{esc(h['from_name'])}</b> -&gt; <b>{esc(h['to_name'])}</b><pre>{esc(h['summary'])}</pre><div class=muted>assumptions: {esc(h['assumptions_json'])}<br>unknowns: {esc(h['unknowns_json'])}</div></div>" for h in hs) or "<p>No handoffs recorded.</p>"
     eh="".join(f"<div class=row><b>{('not evaluated' if e['score'] is None else f'{e["score"]:.2f}')}</b> &middot; {'PASS' if e['passed'] else 'FAIL'}<pre>{esc(e['failures_json'])}</pre></div>" for e in evs) or "<p>No evaluation yet.</p>"
     sh="".join(f"<div class=row><a href='{esc(s['source_url'])}' target=_blank>{esc(s['source_title'] or s['source_url'])}</a></div>" for s in sources if s['source_url']) or "<p>No captured sources.</p>"
     ac="".join(f"<div class=row><small>{esc(e['created_at'][11:19])}</small> {esc(e['message'])}</div>" for e in events)
     retry=f"<form method=post action='/goals/{gid}/retry'><button>Retry goal</button></form>" if g['status'] in ('failed','incomplete','interrupted','verification_failed') else ""
     refresh="<script>setTimeout(()=>location.reload(),4000)</script>" if g['status'] in ('queued','planning','executing') else ""
-    return f"""<!doctype html><meta charset='utf-8'><meta name=viewport content='width=device-width,initial-scale=1'><title>{esc(g['title'])}</title><style>body{{margin:0;background:#f4f6f8;color:#111;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}main{{max-width:1040px;margin:auto;padding:24px 18px 48px}}section{{background:#fff;border:1px solid #dfe3e8;border-radius:16px;box-shadow:0 1px 2px rgba(16,24,40,.04);padding:18px;margin:14px 0}}h1{{font-size:30px;letter-spacing:-.5px}}pre{{white-space:pre-wrap;background:#f7f8fa;border:1px solid #eceff2;padding:13px;border-radius:10px;overflow:auto;line-height:1.45}}.row{{padding:11px 0;border-bottom:1px solid #eceff2}}button{{width:100%;padding:12px;background:#111;color:#fff;border:0;border-radius:10px;font-weight:700}}a{{color:#145ac6;text-decoration:none}}a:hover{{text-decoration:underline}}.muted{{color:#69717c;font-size:.9em}}details{{border-bottom:1px solid #eceff2;padding:10px 0}}summary{{cursor:pointer}}@media(max-width:760px){{main{{padding:18px 12px 36px}}h1{{font-size:26px}}}}</style><main><a href='/'>&larr; Workforce dashboard</a><h1>{esc(g['title'])}</h1><section><b>Version:</b> {APP_VERSION} &middot; <b>Status:</b> {esc(g['status'])}<br><b>Budget:</b> ${g['spent']:.4f}/${g['budget']:.2f} &middot; <b>Replans:</b> {g['replan_count']}/{g['max_replans']}</section>{retry}<section><h2>CEO plan</h2><pre>{esc(g['plan_json'] or 'Planning in progress...')}</pre></section><section><h2>Task execution</h2>{th}</section><section><h2>Evaluator</h2>{eh}</section><section><h2>Agent handoffs</h2>{hh}</section><section><h2>Evidence / sources</h2>{sh}</section><section><h2>Final output</h2><pre>{esc(g['final_output'] or 'Verification/report in progress...')}</pre></section><section><h2>Activity</h2>{ac}</section></main>{refresh}"""
+    return f"""<!doctype html><meta charset='utf-8'><meta name=viewport content='width=device-width,initial-scale=1'><title>{esc(g['title'])}</title><style>body{{margin:0;background:#f4f6f8;color:#111;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}main{{max-width:1040px;margin:auto;padding:24px 18px 48px}}section{{background:#fff;border:1px solid #dfe3e8;border-radius:16px;box-shadow:0 1px 2px rgba(16,24,40,.04);padding:18px;margin:14px 0}}h1{{font-size:30px;letter-spacing:-.5px}}pre{{white-space:pre-wrap;background:#f7f8fa;border:1px solid #eceff2;padding:13px;border-radius:10px;overflow:auto;line-height:1.45}}.row{{padding:11px 0;border-bottom:1px solid #eceff2}}button{{width:100%;padding:12px;background:#111;color:#fff;border:0;border-radius:10px;font-weight:700}}a{{color:#145ac6;text-decoration:none}}a:hover{{text-decoration:underline}}.muted{{color:#69717c;font-size:.9em}}details{{border-bottom:1px solid #eceff2;padding:10px 0}}summary{{cursor:pointer}}@media(max-width:760px){{main{{padding:18px 12px 36px}}h1{{font-size:26px}}}}</style><main><a href='/'>&larr; Workforce dashboard</a><h1>{esc(g['title'])}</h1><section><b>Version:</b> {APP_VERSION} | <b>Status:</b> {esc(g['status'])}<br><b>Budget:</b> ${g['spent']:.4f}/${g['budget']:.2f} | <b>Replans:</b> {g['replan_count']}/{g['max_replans']}</section>{retry}<section><h2>CEO plan</h2><pre>{esc(g['plan_json'] or 'Planning in progress...')}</pre></section><section><h2>Task execution</h2>{th}</section><section><h2>Evaluator</h2>{eh}</section><section><h2>Agent handoffs</h2>{hh}</section><section><h2>Evidence / sources</h2>{sh}</section><section><h2>Final output</h2><pre>{esc(g['final_output'] or 'Verification/report in progress...')}</pre></section><section><h2>Activity</h2>{ac}</section></main>{refresh}"""
 
 @app.get("/api/goals/{gid}")
 def api_goal(request:Request,gid:str):
@@ -933,7 +972,7 @@ def diagnostics_generation(request:Request):
     key=os.getenv("OPENAI_API_KEY");model=os.getenv("OPENAI_MODEL","gpt-5-mini")
     if not key:return JSONResponse({"status":"failed","error_type":"ConfigurationError","message":"OPENAI_API_KEY is not configured","model":model},500)
     try:
-        r=call_model(None,None,None,"Reply exactly with OK.","Reply exactly with: OK",purpose="diagnostic",max_output_tokens=32,max_attempts=1)
+        r=call_model(None,None,None,"Reply exactly with OK.","Reply exactly with: OK",purpose="diagnostic",max_output_tokens=128,max_attempts=1)
         return {"status":"ok","message":"Real Responses API generation succeeded.","version":APP_VERSION,"model":r["model"],"output":r["text"],"latency_ms":r["latency_ms"]}
     except Exception as exc:return JSONResponse({"status":"failed","error_type":type(exc).__name__,"message":str(exc),"version":APP_VERSION,"model":model},502)
 
@@ -949,3 +988,4 @@ def health(expected_version: str = ""):
     return {"status":"ok" if match else "version_mismatch","version":APP_VERSION,"schema_version":SCHEMA_VERSION,"database":DB.name,"auth_enabled":bool(APP_ACCESS_TOKEN),"version_match":match,"expected_version":expected_version or None,"pid":os.getpid(),"openai_configured":bool(os.getenv("OPENAI_API_KEY")),"web_research_enabled":ENABLE_WEB_RESEARCH,"build_fingerprint":hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]}
 
 init()
+recover_interrupted_runs()
