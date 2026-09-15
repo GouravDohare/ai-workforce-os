@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ai-workforce-os-v0312
+    env: docker
+    autoDeploy: true
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5-mini
+      - key: ENABLE_WEB_RESEARCH
+        value: "true"
+      - key: DEFAULT_GOAL_BUDGET_USD
+        value: "5.0"
