@@ -6,11 +6,16 @@ from fastapi import FastAPI,Form
 from fastapi.responses import HTMLResponse,RedirectResponse,JSONResponse
 from openai import OpenAI
 
-APP_VERSION='0.3.13'; SCHEMA_VERSION='313-1'
-DB=Path(__file__).resolve().parent/os.getenv('WORKFORCE_DB','workforce_v0313.db')
-MODEL=os.getenv('OPENAI_MODEL','gpt-5-mini'); TIMEOUT=float(os.getenv('OPENAI_TIMEOUT_SECONDS','150'))
+APP_VERSION='0.3.14'; SCHEMA_VERSION='314-1'
+DB=Path(__file__).resolve().parent/os.getenv('WORKFORCE_DB','workforce_v0314.db')
+MODEL=os.getenv('OPENAI_MODEL','gpt-5-mini'); TIMEOUT=float(os.getenv('OPENAI_TIMEOUT_SECONDS','180'))
 MAX_RETRIES=int(os.getenv('OPENAI_MAX_RETRIES','1')); DEFAULT_BUDGET=float(os.getenv('DEFAULT_GOAL_BUDGET_USD','5.0'))
 MAX_BUDGET=float(os.getenv('MAX_GOAL_BUDGET_USD','50.0')); WEB=os.getenv('ENABLE_WEB_RESEARCH','true').lower()=='true'
+RUN_TIMEOUT=float(os.getenv('RUN_TIMEOUT_SECONDS','600'))
+PLANNER_TOKENS=int(os.getenv('PLANNER_MAX_OUTPUT_TOKENS','2000'))
+WEB_TOKENS=int(os.getenv('WEB_MAX_OUTPUT_TOKENS','8000'))
+TASK_TOKENS=int(os.getenv('TASK_MAX_OUTPUT_TOKENS','4500'))
+REPORT_TOKENS=int(os.getenv('REPORT_MAX_OUTPUT_TOKENS','7000'))
 executor=ThreadPoolExecutor(max_workers=int(os.getenv('MAX_CONCURRENT_TASKS','3'))); app=FastAPI(title='AI Workforce OS',version=APP_VERSION)
 
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -68,14 +73,22 @@ def text_of(resp):
 def model(run,purpose,prompt,web=False,tokens=3000,task=None):
  start=time.time(); event(run,'model_start',f'Model call started: {purpose}',task)
  try:
-  client=OpenAI(timeout=TIMEOUT,max_retries=MAX_RETRIES); kw={'model':MODEL,'input':prompt,'max_output_tokens':tokens}
+  client=OpenAI(timeout=TIMEOUT,max_retries=MAX_RETRIES)
+  kw={'model':MODEL,'input':prompt,'max_output_tokens':tokens}
   if web and WEB: kw['tools']=[{'type':'web_search'}]
   resp=client.responses.create(**kw); txt=text_of(resp)
-  if getattr(resp,'status',None)=='incomplete': raise RuntimeError(f"Model response incomplete: {getattr(getattr(resp,'incomplete_details',None),'reason','unknown')}")
+  status=getattr(resp,'status',None)
+  if status=='incomplete':
+   reason=getattr(getattr(resp,'incomplete_details',None),'reason','unknown')
+   raise RuntimeError(f'Model response incomplete: {reason}')
   if not txt: raise RuntimeError('Model returned empty output')
-  write('INSERT INTO model_calls VALUES(?,?,?,?,?,?,?,?,?)',(uid(),run,task,purpose,datetime.fromtimestamp(start,tz=timezone.utc).isoformat(),now(),int((time.time()-start)*1000),None,None)); event(run,'model_ok',f'Model call completed: {purpose}',task); return resp,txt
+  write('INSERT INTO model_calls VALUES(?,?,?,?,?,?,?,?,?)',(uid(),run,task,purpose,datetime.fromtimestamp(start,tz=timezone.utc).isoformat(),now(),int((time.time()-start)*1000),None,None))
+  event(run,'model_ok',f'Model call completed: {purpose}',task)
+  return resp,txt
  except Exception as e:
-  write('INSERT INTO model_calls VALUES(?,?,?,?,?,?,?,?,?)',(uid(),run,task,purpose,datetime.fromtimestamp(start,tz=timezone.utc).isoformat(),now(),int((time.time()-start)*1000),type(e).__name__,str(e))); event(run,'model_error',f'Model call failed: {purpose}: {e}',task); raise
+  write('INSERT INTO model_calls VALUES(?,?,?,?,?,?,?,?,?)',(uid(),run,task,purpose,datetime.fromtimestamp(start,tz=timezone.utc).isoformat(),now(),int((time.time()-start)*1000),type(e).__name__,str(e)))
+  event(run,'model_error',f'Model call failed: {purpose}: {e}',task)
+  raise
 
 def capture(resp,run,task):
  for item in getattr(resp,'output',[]) or []:
@@ -94,7 +107,7 @@ def fallback():
 def plan(run,g):
  p=f'''You are the CEO of a governed AI workforce. Plan the objective into 3-7 focused tasks. Allowed roles: research, analyst, engineering, product, procurement, data, qa, report. Keep each task small enough for one model call. Return ONLY JSON in this exact shape: {{"tasks":[{{"id":"T1","title":"...","instructions":"...","role":"research","depends":[],"required":1,"web":1,"phase":"work"}}]}}. Objective: {g["title"]}. Description: {g["description"]}. Success criteria: {g["criteria"]}.'''
  try:
-  _,t=model(run,'planner',p,False,3000); m=re.search(r'\{.*\}',t,re.S); x=json.loads(m.group(0)) if m else None
+  _,t=model(run,'planner',p,False,PLANNER_TOKENS); m=re.search(r'\{.*\}',t,re.S); x=json.loads(m.group(0)) if m else None
   if not x or not x.get('tasks'): raise ValueError('Planner returned no tasks')
   ids={t['id'] for t in x['tasks']}
   for t in x['tasks']:
@@ -106,36 +119,75 @@ def upstream(task):
  rs=rows('SELECT t.plan_id,t.title,t.output,t.status FROM tasks t JOIN deps d ON d.upstream=t.id WHERE d.downstream=?',(task['id'],))
  return '\n\n'.join(f"{r['plan_id']} {r['title']} [{r['status']}]\n{r['output'] or ''}" for r in rs)
 
-def do_task(t,run):
- for attempt in range(1,t['max_attempts']+1):
-  write('UPDATE tasks SET status=\'running\',attempts=?,updated_at=? WHERE id=?',(attempt,now(),t['id'])); event(run,'task_start',f"{t['role']} started {t['title']}",t['id']); g=get_goal_from_run(run)
-  prompt=f'''You are the {t['role']} agent. Objective: {g['title']}. Task: {t['title']}. Instructions: {t['instructions']}. Upstream work: {upstream(t) or 'none'}. Be concise but useful. Clearly label sourced facts, assumptions and unknowns. Never invent sources.'''
+def classify_error(e):
+ msg=str(e).lower()
+ if any(x in msg for x in ('timeout','timed out','rate limit','connection','temporarily unavailable','server error','502','503','504')): return 'transient'
+ return 'permanent'
+
+def task_tokens(t):
+ phase=(t['phase'] or '').lower(); role=(t['role'] or '').lower()
+ if bool(t['web']): return WEB_TOKENS
+ if phase=='report' or role=='report': return REPORT_TOKENS
+ return TASK_TOKENS
+
+def do_task(t,run,deadline):
+ max_attempts=max(1,int(t['max_attempts'] or 1))
+ for attempt in range(1,max_attempts+1):
+  if time.time()>deadline:
+   write("UPDATE tasks SET status='failed',error_type='run_timeout',error_message=?,updated_at=? WHERE id=?",('Run execution deadline exceeded.',now(),t['id']))
+   event(run,'task_failed',f"{t['title']}: run deadline exceeded",t['id']); return False
+  write("UPDATE tasks SET status='running',attempts=?,updated_at=? WHERE id=?",(attempt,now(),t['id']))
+  event(run,'task_start',f"{t['role']} started {t['title']} (attempt {attempt})",t['id'])
+  g=get_goal_from_run(run)
+  if not g:
+   write("UPDATE tasks SET status='failed',error_type='missing_goal',error_message=?,updated_at=? WHERE id=?",('Goal not found.',now(),t['id'])); return False
+  prompt=(f"You are the {t['role']} agent in a governed AI workforce. Objective: {g['title']}. Task: {t['title']}. Instructions: {t['instructions']}. Upstream work: {upstream(t) or 'none'}. Produce a useful, bounded result for downstream agents. Clearly label sourced facts, assumptions and unknowns. Never invent sources. For web research, prioritize a few authoritative sources and return concise findings plus source titles/URLs or source citations. Do not spend output on meta-commentary.")
   try:
-   resp,out=model(run,'research' if t['web'] else t['role'],prompt,bool(t['web']),3000 if t['web'] else 3500,t['id'])
+   resp,out=model(run,'research' if t['web'] else t['role'],prompt,bool(t['web']),task_tokens(t),t['id'])
    if t['web']: capture(resp,run,t['id'])
-   write('UPDATE tasks SET status=\'completed\',output=?,updated_at=? WHERE id=?',(out,now(),t['id'])); event(run,'task_ok',f"Task completed: {t['title']}",t['id']); return True
+   write("UPDATE tasks SET status='completed',output=?,error_type=NULL,error_message=NULL,updated_at=? WHERE id=?",(out,now(),t['id']))
+   event(run,'task_ok',f"Task completed: {t['title']}",t['id']); return True
   except Exception as e:
-   transient=any(x in str(e).lower() for x in ('timeout','timed out','rate limit','connection'))
-   final=attempt>=t['max_attempts']; write('UPDATE tasks SET status=?,error_type=?,error_message=?,updated_at=? WHERE id=?',('failed' if final else 'queued','transient_timeout' if transient else type(e).__name__,str(e),now(),t['id']))
+   kind=classify_error(e)
+   final=(attempt>=max_attempts) or (kind=='permanent')
+   next_status='failed' if final else 'queued'
+   et='permanent_failure' if kind=='permanent' else 'transient_failure'
+   write("UPDATE tasks SET status=?,error_type=?,error_message=?,updated_at=? WHERE id=?",(next_status,et,str(e),now(),t['id']))
    event(run,'task_failed' if final else 'task_retry',f"{t['title']}: {e}",t['id'])
-   if final or not transient: return False
+   if final: return False
  return False
 
 def schedule(run):
+ deadline=time.time()+RUN_TIMEOUT
  while True:
+  if time.time()>deadline:
+   for t in rows("SELECT * FROM tasks WHERE run_id=? AND status IN ('queued','pending','running')",(run,)):
+    write("UPDATE tasks SET status='failed',error_type='run_timeout',error_message=?,updated_at=? WHERE id=?",('Run execution deadline exceeded.',now(),t['id']))
+   event(run,'run_timeout','Run execution deadline exceeded.')
+   return rows('SELECT * FROM tasks WHERE run_id=?',(run,))
   pending=rows("SELECT * FROM tasks WHERE run_id=? AND status IN ('queued','pending') ORDER BY rowid",(run,))
   if not pending: return rows('SELECT * FROM tasks WHERE run_id=?',(run,))
   ready=[]; progress=False
   for t in pending:
    ds=rows('SELECT t.status FROM tasks t JOIN deps d ON d.upstream=t.id WHERE d.downstream=?',(t['id'],))
    if any(x[0] in ('failed','interrupted','blocked') for x in ds):
-    write('UPDATE tasks SET status=\'blocked\',error_type=\'dependency_blocked\',error_message=?,updated_at=? WHERE id=?',(str([x[0] for x in ds]),now(),t['id'])); progress=True
+    write("UPDATE tasks SET status='blocked',error_type='dependency_blocked',error_message=?,updated_at=? WHERE id=?",(str([x[0] for x in ds]),now(),t['id']))
+    event(run,'task_blocked',f"{t['title']} blocked by dependency.",t['id']); progress=True
    elif all(x[0]=='completed' for x in ds): ready.append(t)
   if ready:
-   fs=[executor.submit(do_task,t,run) for t in ready]
-   for f in fs: f.result()
+   fs=[executor.submit(do_task,t,run,deadline) for t in ready]
+   for f in fs:
+    try: f.result()
+    except Exception as e: event(run,'worker_error',f'Worker exception: {type(e).__name__}: {e}')
    progress=True
-  if not progress: time.sleep(.5)
+  if not progress:
+   unresolved=rows("SELECT plan_id,title FROM tasks WHERE run_id=? AND status IN ('queued','pending')",(run,))
+   if unresolved:
+    for t in unresolved:
+     write("UPDATE tasks SET status='blocked',error_type='scheduler_stall',error_message=?,updated_at=? WHERE run_id=? AND plan_id=?",('Scheduler could not resolve dependencies.',now(),run,t['plan_id']))
+    event(run,'scheduler_stall','Scheduler stopped: unresolved task dependencies.')
+   return rows('SELECT * FROM tasks WHERE run_id=?',(run,))
+  time.sleep(.2)
 
 def evaluate(run):
  ts=rows('SELECT * FROM tasks WHERE run_id=?',(run,)); req=[t for t in ts if t['required']]; fails=[]; checks=[]
@@ -161,25 +213,32 @@ def run_goal(run):
    tid=uid(); ids[t['id']]=tid; write('INSERT INTO tasks(id,run_id,plan_id,role,title,instructions,required,web,phase,status,max_attempts,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(tid,run,t['id'],t.get('role','analyst'),t['title'],t['instructions'],int(t.get('required',1)),int(t.get('web',0)),t.get('phase','work'),'queued',2,now(),now()))
   for t in p['tasks']:
    for d in t.get('depends',[]): write('INSERT INTO deps VALUES(?,?,?,?,?)',(uid(),run,ids[d],ids[t['id']],now()))
-  schedule(run); passed,fails=evaluate(run); out=final(run); status='completed' if passed else 'incomplete'
+  schedule(run); passed,fails=evaluate(run); out=final(run); all_tasks=rows('SELECT status FROM tasks WHERE run_id=?',(run,)); status='completed' if passed else ('failed' if any(x[0]=='failed' for x in all_tasks) else 'incomplete')
   write('UPDATE goals SET status=?,final_output=?,updated_at=? WHERE id=?',(status,out,now(),g['id'])); write('UPDATE runs SET status=?,ended_at=?,reason=? WHERE id=?',(status,now(),'passed' if passed else '; '.join(fails),run)); event(run,'run_complete',f'Run {status}.')
  except Exception as e:
   write('UPDATE goals SET status=\'failed\',final_output=?,updated_at=? WHERE id=?',(f'RUN FAILED: {type(e).__name__}: {e}',now(),g['id'])); write('UPDATE runs SET status=\'failed\',ended_at=?,reason=? WHERE id=?',(now(),str(e),run)); event(run,'run_failed',f'Run failed: {type(e).__name__}: {e}')
 
 def start(gid):
- g=one('SELECT * FROM goals WHERE id=?',(gid,)); n=(one('SELECT COALESCE(MAX(run_number),0)+1 FROM runs WHERE goal_id=?',(gid,))[0]); r=uid(); write('INSERT INTO runs VALUES(?,?,?,?,?,?,?,?)',(r,gid,n,'running',None,now(),None,now())); write('UPDATE goals SET status=\'running\',current_run_id=?,updated_at=? WHERE id=?',(r,now(),gid)); event(r,'run_start','Workforce run started.'); executor.submit(run_goal,r)
+ g=one('SELECT * FROM goals WHERE id=?',(gid,))
+ if not g: return
+ if g['status'] in ('running','queued') and g['current_run_id']: return
+ n=(one('SELECT COALESCE(MAX(run_number),0)+1 FROM runs WHERE goal_id=?',(gid,))[0]); r=uid()
+ write('INSERT INTO runs VALUES(?,?,?,?,?,?,?,?)',(r,gid,n,'running',None,now(),None,now()))
+ write("UPDATE goals SET status='running',current_run_id=?,updated_at=? WHERE id=?",(r,now(),gid))
+ event(r,'run_start','Workforce run started.')
+ executor.submit(run_goal,r)
 
 @app.get('/health')
 def health(): return {'status':'ok','app_version':APP_VERSION,'schema_version':SCHEMA_VERSION,'model':MODEL,'db':DB.name}
 @app.get('/diagnostics/generation')
 def gen():
  try:
-  r=uid(); s=time.time(); _,t=model(r,'diagnostic_generation','Reply with exactly OK.',False,4096); return {'status':'ok','message':'Real Responses API generation succeeded.','version':APP_VERSION,'model':MODEL,'output':t,'latency_ms':int((time.time()-s)*1000),'max_output_tokens':4096}
+  r=uid(); s=time.time(); _,t=model(r,'diagnostic_generation','Reply with exactly OK.',False,4096); return {'status':'ok','message':'Real Responses API generation succeeded.','version':APP_VERSION,'model':MODEL,'output':t,'latency_ms':int((time.time()-s)*1000),'max_output_tokens':4096,'timeout_seconds':TIMEOUT}
  except Exception as e:return JSONResponse({'status':'failed','error_type':type(e).__name__,'message':str(e),'version':APP_VERSION,'model':MODEL},500)
 @app.get('/diagnostics/web')
 def wdiag():
  try:
-  r=uid(); s=time.time(); resp,t=model(r,'diagnostic_web','Find one current official OpenAI Responses API documentation page. Return its title and URL.',True,8000); capture(resp,r,None); return {'status':'ok','message':'Real Responses API web search succeeded.','version':APP_VERSION,'model':MODEL,'output':t,'latency_ms':int((time.time()-s)*1000),'max_output_tokens':8000}
+  r=uid(); s=time.time(); resp,t=model(r,'diagnostic_web','Find one current official OpenAI Responses API documentation page. Return its title and URL.',True,8000); capture(resp,r,None); return {'status':'ok','message':'Real Responses API web search succeeded.','version':APP_VERSION,'model':MODEL,'output':t,'latency_ms':int((time.time()-s)*1000),'max_output_tokens':8000,'timeout_seconds':TIMEOUT}
  except Exception as e:return JSONResponse({'status':'failed','error_type':type(e).__name__,'message':str(e),'version':APP_VERSION,'model':MODEL},500)
 @app.get('/api/goals/{gid}')
 def api_goal(gid):
