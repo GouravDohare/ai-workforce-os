@@ -8,7 +8,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-APP_VERSION = "0.3.11"
+APP_VERSION = "0.3.9"
 SCHEMA_VERSION = "035-7"
 DB = Path(__file__).with_name("workforce_v035.db")
 MAX_TASKS = int(os.getenv("MAX_TASKS_PER_GOAL", "10"))
@@ -265,7 +265,7 @@ def settle_budget(reservation_id,actual,goal_id,task_id,agent_id,call_id):
     finally:c.close()
 
 
-def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,structured_schema=None,max_output_tokens=6000,max_attempts=2,reasoning_effort=None):
+def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,structured_schema=None,max_output_tokens=6000,max_attempts=2):
     key=os.getenv("OPENAI_API_KEY")
     if not key: raise RuntimeError("OPENAI_API_KEY is not configured")
     from openai import OpenAI
@@ -285,9 +285,11 @@ def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,str
         try:
             client=OpenAI(api_key=key,timeout=OPENAI_TIMEOUT,max_retries=0)
             kwargs={"model":model,"input":f"SYSTEM:\n{system}\n\nUSER:\n{prompt}","max_output_tokens":max_output_tokens}
-            if web: kwargs["tools"]=[{"type":"web_search"}]
-            if reasoning_effort:
-                kwargs["reasoning"]={"effort": reasoning_effort}
+            if web:
+                # OpenAI does not allow reasoning_effort on this web-search request path.
+                # Keep the web call tool-compatible; never attach reasoning_effort here.
+                kwargs["tools"]=[{"type":"web_search"}]
+                kwargs.pop("reasoning_effort", None)
             request_schema = None if web else structured_schema
             if request_schema: kwargs["text"]={"format":{"type":"json_schema","name":request_schema["name"],"strict":True,"schema":request_schema["schema"]}}
             resp=client.responses.create(**kwargs)
@@ -688,7 +690,7 @@ def run_task(run_id,task_id):
             if wants_web and not tool_allowed(agent, "web_search"):
                 log_event(run_id=run_id, goal_id=goal["id"], task_id=task_id, kind="capability_gap", message="Task requested web search but assigned agent lacks web_research capability.")
                 wants_web = False
-            result=call_model(run_id,task_id,task["agent_instance_id"],system,prompt,purpose="task",use_web=wants_web,structured_schema=None if wants_web else task_output_schema(),max_output_tokens=8000 if wants_web else 6000,max_attempts=1,reasoning_effort="minimal" if wants_web else None)
+            result=call_model(run_id,task_id,task["agent_instance_id"],system,prompt,purpose="task",use_web=wants_web,structured_schema=None if wants_web else task_output_schema(),max_output_tokens=8000 if wants_web else 6000,max_attempts=1)
             data=result["structured"]
             if wants_web and not isinstance(data,dict):
                 raw=result["text"].strip()
@@ -895,8 +897,8 @@ def diagnostics_web(request:Request):
         r=call_model(None,None,None,
             "You are a web-search diagnostic agent. Use the web search tool and return a short factual answer with source links.",
             "Search the web for the current official OpenAI API documentation page for the Responses API. Return the page title and URL.",
-            purpose="diagnostic",use_web=True,max_output_tokens=8000,max_attempts=1,reasoning_effort="minimal")
-        return {"status":"ok","message":"Real Responses API web search succeeded.","version":APP_VERSION,"model":r["model"],"output":r["text"],"citations":r.get("citations",[]),"latency_ms":r["latency_ms"]}
+            purpose="diagnostic",use_web=True,max_output_tokens=8000,max_attempts=1)
+        return {"status":"ok","message":"Real Responses API web search succeeded.","version":APP_VERSION,"model":r["model"],"output":r["text"],"citations":r.get("citations",[]),"latency_ms":r["latency_ms"],"max_output_tokens":8000}
     except Exception as exc:
         return JSONResponse({"status":"failed","error_type":type(exc).__name__,"message":str(exc),"version":APP_VERSION,"model":os.getenv("OPENAI_MODEL","gpt-5-mini")},502)
 
@@ -977,15 +979,12 @@ def diagnostics_generation(request:Request):
     if denied:return denied
     key=os.getenv("OPENAI_API_KEY");model=os.getenv("OPENAI_MODEL","gpt-5-mini")
     if not key:return JSONResponse({"status":"failed","error_type":"ConfigurationError","message":"OPENAI_API_KEY is not configured","model":model},500)
-    # This endpoint is a health check, not an intelligence benchmark. Keep reasoning
-    # deliberately minimal so a tiny "OK" cannot consume the entire output budget.
-    limit=4096
-    reasoning_effort="minimal"
+    limit=1024
     try:
-        r=call_model(None,None,None,"Reply exactly with OK.","Reply exactly with: OK",purpose="diagnostic",max_output_tokens=limit,max_attempts=1,reasoning_effort=reasoning_effort)
-        return {"status":"ok","message":"Real Responses API generation succeeded.","version":APP_VERSION,"model":r["model"],"output":r["text"],"latency_ms":r["latency_ms"],"max_output_tokens":limit,"reasoning_effort":reasoning_effort}
+        r=call_model(None,None,None,"Reply exactly with OK.","Reply exactly with: OK",purpose="diagnostic",max_output_tokens=limit,max_attempts=1)
+        return {"status":"ok","message":"Real Responses API generation succeeded.","version":APP_VERSION,"model":r["model"],"output":r["text"],"latency_ms":r["latency_ms"],"max_output_tokens":limit}
     except Exception as exc:
-        return JSONResponse({"status":"failed","error_type":type(exc).__name__,"message":str(exc),"version":APP_VERSION,"model":model,"max_output_tokens":limit,"reasoning_effort":reasoning_effort},502)
+        return JSONResponse({"status":"failed","error_type":type(exc).__name__,"message":str(exc),"version":APP_VERSION,"model":model,"max_output_tokens":limit},502)
 
 @app.post("/benchmarks/start")
 def benchmark_start(request: Request, case_name: str = Form(...), expected_version: str = Form(...)):
