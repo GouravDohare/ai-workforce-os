@@ -309,48 +309,46 @@ def call_model(run_id,task_id,agent_id,system,prompt,*,purpose,use_web=False,str
 
 
 def plan_schema():
-    contract = {
+    """Compact planner schema.
+
+    The CEO only chooses the workforce and task graph. Boilerplate contracts,
+    retry policy, and verification defaults are constructed by the application.
+    This keeps structured planner responses small and much less prone to
+    truncation/parse failures on complex objectives.
+    """
+    agent = {
         "type": "object", "additionalProperties": False,
-        "required": ["inputs", "outputs", "success_conditions", "failure_conditions", "evidence_required", "requires_web", "notes"],
+        "required": ["name", "role", "capabilities"],
         "properties": {
-            "inputs": {"type": "array", "items": {"type": "string"}},
-            "outputs": {"type": "array", "items": {"type": "string"}},
-            "success_conditions": {"type": "array", "items": {"type": "string"}},
-            "failure_conditions": {"type": "array", "items": {"type": "string"}},
-            "evidence_required": {"type": "boolean"},
-            "requires_web": {"type": "boolean"},
-            "notes": {"type": "string"}
+            "name": {"type": "string"},
+            "role": {"type": "string"},
+            "capabilities": {"type": "array", "items": {"type": "string"}}
         }
     }
     task = {
         "type": "object", "additionalProperties": False,
-        "required": ["id", "title", "instructions", "agent_role", "depends_on", "dependency_conditions", "required", "requires_web", "budget_limit", "max_attempts", "phase", "contract"],
+        "required": ["id", "title", "instructions", "agent_role", "depends_on", "required", "requires_web", "phase", "success_conditions"],
         "properties": {
-            "id": {"type": "string"}, "title": {"type": "string"}, "instructions": {"type": "string"},
-            "agent_role": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}},
-            "dependency_conditions": {"type": "array", "items": {"type": "string"}},
-            "required": {"type": "boolean"}, "requires_web": {"type": "boolean"},
-            "budget_limit": {"type": "number"}, "max_attempts": {"type": "integer"}, "phase": {"type": "string"},
-            "contract": contract
+            "id": {"type": "string"},
+            "title": {"type": "string"},
+            "instructions": {"type": "string"},
+            "agent_role": {"type": "string"},
+            "depends_on": {"type": "array", "items": {"type": "string"}},
+            "required": {"type": "boolean"},
+            "requires_web": {"type": "boolean"},
+            "phase": {"type": "string"},
+            "success_conditions": {"type": "array", "items": {"type": "string"}}
         }
-    }
-    agent = {
-        "type": "object", "additionalProperties": False,
-        "required": ["name", "role", "instructions", "capabilities"],
-        "properties": {
-            "name": {"type": "string"}, "role": {"type": "string"}, "instructions": {"type": "string"},
-            "capabilities": {"type": "array", "items": {"type": "string"}}
-        }
-    }
-    verification = {
-        "type": "object", "additionalProperties": False, "required": ["required_checks", "pass_threshold"],
-        "properties": {"required_checks": {"type": "array", "items": {"type": "string"}}, "pass_threshold": {"type": "number"}}
     }
     return {"name": "workforce_plan", "schema": {
-        "type": "object", "additionalProperties": False, "required": ["agents", "tasks", "verification"],
-        "properties": {"agents": {"type": "array", "items": agent}, "tasks": {"type": "array", "items": task}, "verification": verification}
+        "type": "object", "additionalProperties": False,
+        "required": ["objective_type", "agents", "tasks"],
+        "properties": {
+            "objective_type": {"type": "string"},
+            "agents": {"type": "array", "items": agent},
+            "tasks": {"type": "array", "items": task}
+        }
     }}
-
 
 def task_output_schema():
     return {"name":"workforce_task_output","schema":{"type":"object","additionalProperties":False,"required":["summary","facts","assumptions","unknowns","claims","recommendations"],"properties":{
@@ -399,6 +397,17 @@ def minimal_safe_plan(g):
             {"id":"T2","title":"Quality verification","instructions":"Check the quantitative analysis for arithmetic errors, missing requested outputs and unsupported assumptions.","agent_role":"qa","depends_on":["T1"],"dependency_conditions":["completed"],"required":True,"requires_web":False,"budget_limit":0.25,"max_attempts":2,"phase":"work","contract":{"inputs":["T1"],"outputs":["verification"],"success_conditions":["critical errors identified or none found"],"failure_conditions":["missing analysis"],"evidence_required":False,"requires_web":False,"notes":"Independent verification."}},
             {"id":"T3","title":"Executive answer","instructions":"Present the verified calculation, assumptions and conclusion in a concise answer.","agent_role":"report","depends_on":["T1","T2"],"dependency_conditions":["completed","completed"],"required":True,"requires_web":False,"budget_limit":0.30,"max_attempts":2,"phase":"report","contract":{"inputs":["T1","T2"],"outputs":["decision_ready_answer"],"success_conditions":["all requested metrics addressed"],"failure_conditions":["verification failed"],"evidence_required":False,"requires_web":False,"notes":"No external research required."}},
         ]
+    elif kind == "research" or (kind == "mixed" and any(x in f"{_gval(g,'title')} {_gval(g,'description')} {_gval(g,'criteria')}".lower() for x in ("research", "market", "competitor", "industry", "sources", "evidence"))):
+        agents=[
+            {"name":"Research Specialist","role":"research","instructions":"Research the objective using external sources when required. Separate sourced facts from assumptions and unknowns.","capabilities":["web_research","source_verification","market_research"]},
+            {"name":"Quality & Source Reviewer","role":"qa","instructions":"Check evidence quality, source support, contradictions, omissions and whether the success criteria are satisfied.","capabilities":["qa","source_verification","risk"]},
+            {"name":"Executive Report Writer","role":"report","instructions":"Synthesize verified findings into a decision-ready report without inventing evidence.","capabilities":["synthesis","report","decision_support"]}
+        ]
+        tasks=[
+            {"id":"T1","title":"External research","instructions":"Research the requested topic using web sources. Capture material facts, source URLs, assumptions, unknowns and relevant quantitative or qualitative findings. Do not invent evidence.","agent_role":"research","depends_on":[],"dependency_conditions":[],"required":True,"requires_web":True,"budget_limit":0.50,"max_attempts":2,"phase":"work","contract":{"inputs":[],"outputs":["findings","evidence","assumptions","unknowns"],"success_conditions":["objective researched","material claims supported by sources"],"failure_conditions":["insufficient evidence"],"evidence_required":True,"requires_web":True,"notes":"External evidence is required for this objective."}},
+            {"id":"T2","title":"Source and quality verification","instructions":"Review the research for unsupported claims, weak or conflicting evidence, missing success criteria and important omissions. Identify what is verified versus uncertain.","agent_role":"qa","depends_on":["T1"],"dependency_conditions":["completed"],"required":True,"requires_web":False,"budget_limit":0.20,"max_attempts":2,"phase":"work","contract":{"inputs":["T1"],"outputs":["verification"],"success_conditions":["material claims checked","contradictions identified or none found"],"failure_conditions":["missing research"],"evidence_required":True,"requires_web":False,"notes":"Independent verification of research evidence."}},
+            {"id":"T3","title":"Executive research report","instructions":"Present the verified research, evidence, assumptions, unknowns, risks, conclusions and next actions. Clearly distinguish sourced facts from inference.","agent_role":"report","depends_on":["T1","T2"],"dependency_conditions":["completed","completed"],"required":True,"requires_web":False,"budget_limit":0.30,"max_attempts":2,"phase":"report","contract":{"inputs":["T1","T2"],"outputs":["decision_ready_answer"],"success_conditions":["all requested items addressed","sources and uncertainty clearly represented"],"failure_conditions":["verification failed"],"evidence_required":True,"requires_web":False,"notes":"Final report uses the verified workforce record."}}
+        ]
     elif kind == "action":
         agents=[{"name":"Action Planner","role":"operator","instructions":"Translate the request into safe executable steps and identify approvals or missing permissions.","capabilities":["planning","operations"]},{"name":"Quality Reviewer","role":"qa","instructions":"Check safety, completeness and permissions before action.","capabilities":["qa","risk","verification"]},{"name":"Executive Report Writer","role":"report","instructions":"Summarize the action plan and results.","capabilities":["synthesis","report"]}]
         tasks=[
@@ -444,13 +453,16 @@ def normalize_plan(plan,g):
         t["budget_limit"]=max(0,float(t.get("budget_limit",0) or 0))
         t["max_attempts"]=max(1,min(3,int(t.get("max_attempts",2) or 2)))
         t["phase"]="report" if str(t.get("phase","work")).lower()=="report" else "work"
+        if not isinstance(t.get("success_conditions"), list):
+            t["success_conditions"]=[]
+        t["success_conditions"]=[str(x) for x in t.get("success_conditions",[]) if str(x).strip()]
         c=t.get("contract") if isinstance(t.get("contract"),dict) else {}
         t["contract"]={
             "inputs":[str(x) for x in c.get("inputs",[])],
             "outputs":[str(x) for x in c.get("outputs",[])],
-            "success_conditions":[str(x) for x in c.get("success_conditions",[])],
+            "success_conditions":[str(x) for x in (c.get("success_conditions",[]) or t.get("success_conditions",[]))],
             "failure_conditions":[str(x) for x in c.get("failure_conditions",[])],
-            "evidence_required":bool(c.get("evidence_required",False)),
+            "evidence_required":bool(c.get("evidence_required",False) or t["requires_web"]),
             "requires_web":t["requires_web"],
             "notes":str(c.get("notes",""))
         }
@@ -462,6 +474,35 @@ def normalize_plan(plan,g):
         while len(cond)<len(deps): cond.append("completed")
         t["depends_on"]=deps
         t["dependency_conditions"]=cond[:len(deps)]
+    # Hard objective invariants: the application, not the model, owns these safety-critical requirements.
+    goal_text=f"{_gval(g,'title')} {_gval(g,'description')} {_gval(g,'criteria')}".lower()
+    explicit_no_web=any(x in goal_text for x in ("do not browse", "don't browse", "no web", "without external research", "no external research"))
+    research_required=(not explicit_no_web) and any(x in goal_text for x in ("research", "market research", "competitor", "industry", "sources", "evidence", "current market", "market size"))
+    if research_required:
+        work_tasks=[t for t in out if t.get("phase")=="work"]
+        web_tasks=[t for t in work_tasks if t.get("requires_web")]
+        if not web_tasks:
+            if len(out)<MAX_TASKS:
+                rid="T_RESEARCH"
+                used={t["id"] for t in out}
+                n=1
+                while rid in used:
+                    n+=1; rid=f"T_RESEARCH_{n}"
+                out.insert(0,{"id":rid,"title":"External research","instructions":"Research the requested objective using web sources. Capture material findings, source URLs, assumptions and unknowns. Do not invent evidence.","agent_role":"research","depends_on":[],"dependency_conditions":[],"required":True,"requires_web":True,"budget_limit":0.50,"max_attempts":2,"phase":"work","contract":{"inputs":[],"outputs":["findings","evidence","assumptions","unknowns"],"success_conditions":["objective researched","material claims supported by sources"],"failure_conditions":["insufficient evidence"],"evidence_required":True,"requires_web":True,"notes":"Injected because the objective requires external research."},"success_conditions":["objective researched","material claims supported by sources"]})
+            else:
+                # Preserve the user's requirement even at the task cap.
+                candidate=work_tasks[0] if work_tasks else out[0]
+                candidate["agent_role"]="research"
+                candidate["requires_web"]=True
+                candidate["title"]="External research"
+                candidate["instructions"]="Research the requested objective using web sources. Capture material findings, source URLs, assumptions and unknowns. Do not invent evidence."
+                candidate["success_conditions"]=["objective researched","material claims supported by sources"]
+                candidate["contract"]={"inputs":[],"outputs":["findings","evidence","assumptions","unknowns"],"success_conditions":candidate["success_conditions"],"failure_conditions":["insufficient evidence"],"evidence_required":True,"requires_web":True,"notes":"Injected because the objective requires external research."}
+        else:
+            for t in web_tasks:
+                t["contract"]["requires_web"]=True
+                t["contract"]["evidence_required"]=True
+
     # Inject a report task only when the plan has none, and use a simple report role rather than replacing an arbitrary task.
     if not any(t.get("phase")=="report" or t.get("agent_role")=="report" for t in out):
         if len(out)<MAX_TASKS:
@@ -490,6 +531,12 @@ def normalize_plan(plan,g):
     plan["agents"]=agents[:MAX_AGENTS]
     plan["tasks"]=out
     plan["verification"]=plan.get("verification") if isinstance(plan.get("verification"),dict) else default_plan(g)["verification"]
+    # Final semantic guard. Never return a plan that violates an explicit research requirement.
+    goal_text=f"{_gval(g,'title')} {_gval(g,'description')} {_gval(g,'criteria')}".lower()
+    explicit_no_web=any(x in goal_text for x in ("do not browse", "don't browse", "no web", "without external research", "no external research"))
+    research_required=(not explicit_no_web) and any(x in goal_text for x in ("research", "market research", "competitor", "industry", "sources", "evidence", "current market", "market size"))
+    if research_required and not any(t.get("requires_web") for t in plan["tasks"] if t.get("phase")=="work"):
+        raise ValueError("Plan invariant failed: research objective has no web-enabled work task")
     return plan
 
 
@@ -505,20 +552,26 @@ def ensure_agent(run_id,spec):
     iid=uid();write("INSERT INTO agent_instances VALUES(?,?,?,?,?,?,?,?,?,?)",(iid,run_id,p["id"],spec.get("name") or p["name"],spec.get("instructions"),"idle",0,0,now(),now()));return fetch_one("SELECT * FROM agent_instances WHERE id=?",(iid,))
 
 def make_plan(run_id,g):
-    system="""You are the CEO of an AI workforce. Build the smallest sufficient workforce and task graph for the user's objective. First classify the objective mentally as compute, research, reason, create, action, or mixed. Assign only the capabilities that are actually needed. Do not require web research for deterministic calculations, reasoning, or writing. Detect blocking ambiguity and capability gaps. Dependencies must express real information requirements. Include task contracts, budgets and a verification plan. Never invent evidence. If requirements conflict, expose the conflict rather than silently assuming it away. Return ONLY the schema-defined object."""
-    prompt=f"Objective: {g['title']}\nDescription: {g['description']}\nSuccess criteria: {g['criteria']}\nGoal budget: ${g['budget']:.2f}"
+    system="""You are the CEO of an AI workforce. Build the smallest sufficient workforce and task graph for the user's objective. Return ONLY the compact schema-defined JSON object. Choose specialist roles and task dependencies; do not generate long contracts, budgets, retry policies or verification boilerplate because the application adds those. Preserve explicit user requirements. If the objective requires current external information, research, market facts, competitors, sources or evidence, assign a research task with requires_web=true. Never silently disable a required capability. If requirements conflict, represent the conflict in task instructions rather than inventing facts."""
+    prompt=f"Objective: {g['title']}\nDescription: {g['description']}\nSuccess criteria: {g['criteria']}"
     try:
-        r=call_model(run_id,None,None,system,prompt,purpose="planner",structured_schema=plan_schema(),max_output_tokens=2000,max_attempts=2)
+        r=call_model(run_id,None,None,system,prompt,purpose="planner",structured_schema=plan_schema(),max_output_tokens=1200,max_attempts=2)
         plan=r["structured"]
         if not isinstance(plan,dict) or not plan.get("tasks"):
             raise ValueError("Planner returned an unusable structured plan")
-        log_event(run_id=run_id,goal_id=g["id"],kind="plan_created",message="CEO created structured plan.",payload={"fallback":False,"objective_type":classify_objective(g)})
+        log_event(run_id=run_id,goal_id=g["id"],kind="plan_created",message="CEO created compact structured plan.",payload={"fallback":False,"objective_type":classify_objective(g)})
     except Exception as exc:
-        # Safe recovery: never substitute a generic AI-business workflow for the user's actual objective.
+        # Safe, objective-specific recovery. Never downgrade research to generic reasoning.
         plan=minimal_safe_plan(g)
-        log_event(run_id=run_id,goal_id=g["id"],kind="planner_recovery",message=f"Planner recovery activated: {type(exc).__name__}: {exc}",payload={"degraded":True,"objective_type":classify_objective(g)})
-        write("UPDATE runs SET reason=? WHERE id=?",(f"SAFE_PLANNER_RECOVERY: {type(exc).__name__}",run_id))
-    return normalize_plan(plan,g)
+        log_event(run_id=run_id,goal_id=g["id"],kind="planner_recovery",message=f"Planner recovery activated with objective-specific safe plan: {type(exc).__name__}: {exc}",payload={"degraded":True,"objective_type":classify_objective(g)})
+        write("UPDATE runs SET reason=? WHERE id=?",(f"SAFE_OBJECTIVE_SPECIFIC_RECOVERY: {type(exc).__name__}",run_id))
+    try:
+        return normalize_plan(plan,g)
+    except Exception as exc:
+        # If a model-produced plan violates a hard invariant, replace it with the deterministic safe plan.
+        fallback=minimal_safe_plan(g)
+        log_event(run_id=run_id,goal_id=g["id"],kind="planner_semantic_recovery",message=f"Model plan rejected by semantic guard: {type(exc).__name__}: {exc}",payload={"degraded":True})
+        return normalize_plan(fallback,g)
 
 
 def create_tasks(run_id,plan):
@@ -612,7 +665,7 @@ def run_task(run_id,task_id):
             result=call_model(run_id,task_id,task["agent_instance_id"],system,prompt,purpose="task",use_web=wants_web,structured_schema=task_output_schema(),max_output_tokens=1500,max_attempts=1)
             data=result["structured"]
             if not isinstance(data,dict): raise ValueError("Task structured output is not an object")
-            eids=add_evidence(run_id,task_id,result["citations"]);conf=confidence_from(data,len(eids));aid=create_artifact(run_id,task_id,f"{task['title']} — work output",result["text"])
+            eids=add_evidence(run_id,task_id,result["citations"]);conf=confidence_from(data,len(eids));aid=create_artifact(run_id,task_id,f"{task['title']} â work output",result["text"])
             aended=result.get("ended_at") or now()
             write("INSERT INTO task_attempts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(uid(),task_id,attempt,"completed",result["model"],result.get("started_at",attempt_started_iso),aended,result["latency_ms"],result["input_tokens"],result["output_tokens"],result["cost"],result.get("request_id"),None,json.dumps({"strategy":"primary","request_id":result.get("request_id"),"web":wants_web}),now()))
             write("UPDATE tasks SET status='completed',attempt_count=?,output=?,structured_output_json=?,confidence=?,updated_at=?,error_type=NULL,error_message=NULL WHERE id=?",(attempt,result["text"],json.dumps(data),conf,now(),task_id));write("UPDATE agent_instances SET status='idle',updated_at=? WHERE id=?",(now(),task["agent_instance_id"]))
@@ -774,7 +827,7 @@ def execute_goal(gid):
 
 
 @app.get("/login",response_class=HTMLResponse)
-def login():return "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><h1>AI Workforce OS</h1><form method='post'><input name=token type=password placeholder='Access token' required><button>Sign in</button></form>"
+def login():return "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><h1>AI Workforce OS</h1><form method='post'><input name=token type=password placeholder='Access token' required><button>Sign in</button></form>"
 @app.post("/login")
 def login_post(token:str=Form(...)):
     if not APP_ACCESS_TOKEN or not hmac.compare_digest(token,APP_ACCESS_TOKEN):return HTMLResponse("Invalid token",status_code=401)
@@ -785,9 +838,9 @@ def home(request:Request):
     denied=require_auth(request)
     if denied:return denied
     goals=fetch("SELECT * FROM goals ORDER BY created_at DESC");agents=fetch("SELECT * FROM agent_profiles ORDER BY role")
-    gh="".join(f"<div class=row><a href='/goals/{g['id']}'><b>{esc(g['title'])}</b></a> · {esc(g['status'])} · ${g['spent']:.4f}/${g['budget']:.2f} · replans {g['replan_count']}</div>" for g in goals) or "<p>No objectives yet.</p>"
+    gh="".join(f"<div class=row><a href='/goals/{g['id']}'><b>{esc(g['title'])}</b></a> Â· {esc(g['status'])} Â· ${g['spent']:.4f}/${g['budget']:.2f} Â· replans {g['replan_count']}</div>" for g in goals) or "<p>No objectives yet.</p>"
     ah="".join(f"<div class=card><b>{esc(a['name'])}</b><div class=muted>{esc(a['role'])}</div><p>{esc(a['instructions'])}</p></div>" for a in agents)
-    return f"""<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>AI Workforce OS</title><style>body{{margin:0;background:#f3f5f7;font-family:-apple-system,system-ui}}main{{max-width:1100px;margin:auto;padding:18px}}section,.card{{background:#fff;border:1px solid #dfe3e7;border-radius:14px;padding:16px;margin:12px 0}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}input,textarea,button{{width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:9px;font:inherit}}textarea{{min-height:100px}}button{{background:#111;color:#fff;border:0;font-weight:700}}.row{{padding:10px 0;border-bottom:1px solid #eee}}.muted{{color:#69717c;font-size:.9em}}a{{color:#145ac6;text-decoration:none}}@media(max-width:700px){{.grid{{grid-template-columns:1fr}}}}</style><main><h1>AI WORKFORCE OS <small>{APP_VERSION}</small></h1><div class=grid><section><h2>Give the company an objective</h2><form method=post action=/goals><input name=title placeholder='Objective title' required><textarea name=description placeholder='Describe what you want the company to accomplish.' required></textarea><textarea name=criteria placeholder='What does success look like?' required></textarea><label class=muted for=budget>Budget (USD, optional) - leave blank to use the system safety budget</label><input id=budget name=budget type=number min=0 step=.01 placeholder='e.g. 5.00'><button>Create objective</button></form></section><section><h2>Objectives</h2>{gh}</section></div><section><h2>Workforce profiles</h2><div class=cards>{ah}</div></section></main>"""
+    return f"""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>AI Workforce OS</title><style>body{{margin:0;background:#f3f5f7;font-family:-apple-system,system-ui}}main{{max-width:1100px;margin:auto;padding:18px}}section,.card{{background:#fff;border:1px solid #dfe3e7;border-radius:14px;padding:16px;margin:12px 0}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}}input,textarea,button{{width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:9px;font:inherit}}textarea{{min-height:100px}}button{{background:#111;color:#fff;border:0;font-weight:700}}.row{{padding:10px 0;border-bottom:1px solid #eee}}.muted{{color:#69717c;font-size:.9em}}a{{color:#145ac6;text-decoration:none}}@media(max-width:700px){{.grid{{grid-template-columns:1fr}}}}</style><main><h1>AI WORKFORCE OS <small>{APP_VERSION}</small></h1><div class=grid><section><h2>Give the company an objective</h2><form method=post action=/goals><input name=title placeholder='Objective title' required><textarea name=description placeholder='Describe what you want the company to accomplish.' required></textarea><textarea name=criteria placeholder='What does success look like?' required></textarea><label class=muted for=budget>Budget (USD) â optional; leave blank to use the system safety budget</label><input id=budget name=budget type=number min=0 step=.01 placeholder='e.g. 5.00'><button>Create objective</button></form></section><section><h2>Objectives</h2>{gh}</section></div><section><h2>Workforce profiles</h2><div class=cards>{ah}</div></section></main>"""
 
 @app.post("/goals")
 def create_goal(request:Request,title:str=Form(...),description:str=Form(...),criteria:str=Form(...),budget:Optional[float]=Form(None)):
@@ -822,14 +875,14 @@ def detail(request:Request,gid:str):
     evs=fetch("SELECT * FROM evaluations WHERE run_id=? ORDER BY created_at DESC",(g["current_run_id"],)) if g["current_run_id"] else []
     sources=fetch("SELECT * FROM evidence WHERE run_id=? ORDER BY created_at DESC LIMIT 40",(g["current_run_id"],)) if g["current_run_id"] else []
     events=fetch("SELECT * FROM events WHERE goal_id=? ORDER BY created_at DESC LIMIT 80",(gid,))
-    th="".join(f"<details><summary><b>{esc(t['title'])}</b> — {esc(t['agent_name'])} · {esc(t['status'])} · confidence {esc(t['confidence'])}</summary><p class=muted>attempts={t['attempt_count']} · spend=${t['spent']:.4f} · budget=${t['budget_limit']:.4f}</p><pre>{esc(t['output'] or t['error_message'] or '')}</pre></details>" for t in ts) or "<p>Tasks will appear.</p>"
-    hh="".join(f"<div class=row><b>{esc(h['from_name'])}</b> → <b>{esc(h['to_name'])}</b><pre>{esc(h['summary'])}</pre><div class=muted>assumptions: {esc(h['assumptions_json'])}<br>unknowns: {esc(h['unknowns_json'])}</div></div>" for h in hs) or "<p>No handoffs recorded.</p>"
-    eh="".join(f"<div class=row><b>{('not evaluated' if e['score'] is None else f'{e["score"]:.2f}')}</b> · {'PASS' if e['passed'] else 'FAIL'}<pre>{esc(e['failures_json'])}</pre></div>" for e in evs) or "<p>No evaluation yet.</p>"
+    th="".join(f"<details><summary><b>{esc(t['title'])}</b> â {esc(t['agent_name'])} Â· {esc(t['status'])} Â· confidence {esc(t['confidence'])}</summary><p class=muted>attempts={t['attempt_count']} Â· spend=${t['spent']:.4f} Â· budget=${t['budget_limit']:.4f}</p><pre>{esc(t['output'] or t['error_message'] or '')}</pre></details>" for t in ts) or "<p>Tasks will appear.</p>"
+    hh="".join(f"<div class=row><b>{esc(h['from_name'])}</b> â <b>{esc(h['to_name'])}</b><pre>{esc(h['summary'])}</pre><div class=muted>assumptions: {esc(h['assumptions_json'])}<br>unknowns: {esc(h['unknowns_json'])}</div></div>" for h in hs) or "<p>No handoffs recorded.</p>"
+    eh="".join(f"<div class=row><b>{('not evaluated' if e['score'] is None else f'{e["score"]:.2f}')}</b> Â· {'PASS' if e['passed'] else 'FAIL'}<pre>{esc(e['failures_json'])}</pre></div>" for e in evs) or "<p>No evaluation yet.</p>"
     sh="".join(f"<div class=row><a href='{esc(s['source_url'])}' target=_blank>{esc(s['source_title'] or s['source_url'])}</a></div>" for s in sources if s['source_url']) or "<p>No captured sources.</p>"
     ac="".join(f"<div class=row><small>{esc(e['created_at'][11:19])}</small> {esc(e['message'])}</div>" for e in events)
     retry=f"<form method=post action='/goals/{gid}/retry'><button>Retry goal</button></form>" if g['status'] in ('failed','incomplete','interrupted','verification_failed') else ""
     refresh="<script>setTimeout(()=>location.reload(),4000)</script>" if g['status'] in ('queued','planning','executing') else ""
-    return f"""<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{esc(g['title'])}</title><style>body{{margin:0;background:#f3f5f7;font-family:-apple-system,system-ui}}main{{max-width:1000px;margin:auto;padding:18px}}section{{background:#fff;border:1px solid #dfe3e7;border-radius:14px;padding:16px;margin:14px 0}}pre{{white-space:pre-wrap;background:#f7f8fa;padding:12px;border-radius:9px;overflow:auto}}.row{{padding:10px 0;border-bottom:1px solid #eee}}button{{width:100%;padding:11px;background:#111;color:#fff;border:0;border-radius:9px;font-weight:700}}a{{color:#145ac6;text-decoration:none}}.muted{{color:#69717c;font-size:.9em}}</style><main><a href='/'>← Workforce dashboard</a><h1>{esc(g['title'])}</h1><section><b>Version:</b> {APP_VERSION} · <b>Status:</b> {esc(g['status'])}<br><b>Budget:</b> ${g['spent']:.4f}/${g['budget']:.2f} · <b>Replans:</b> {g['replan_count']}/{g['max_replans']}</section>{retry}<section><h2>CEO plan</h2><pre>{esc(g['plan_json'] or 'Planning in progress...')}</pre></section><section><h2>Task execution</h2>{th}</section><section><h2>Evaluator</h2>{eh}</section><section><h2>Agent handoffs</h2>{hh}</section><section><h2>Evidence / sources</h2>{sh}</section><section><h2>Final output</h2><pre>{esc(g['final_output'] or 'Verification/report in progress...')}</pre></section><section><h2>Activity</h2>{ac}</section></main>{refresh}"""
+    return f"""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>{esc(g['title'])}</title><style>body{{margin:0;background:#f3f5f7;font-family:-apple-system,system-ui}}main{{max-width:1000px;margin:auto;padding:18px}}section{{background:#fff;border:1px solid #dfe3e7;border-radius:14px;padding:16px;margin:14px 0}}pre{{white-space:pre-wrap;background:#f7f8fa;padding:12px;border-radius:9px;overflow:auto}}.row{{padding:10px 0;border-bottom:1px solid #eee}}button{{width:100%;padding:11px;background:#111;color:#fff;border:0;border-radius:9px;font-weight:700}}a{{color:#145ac6;text-decoration:none}}.muted{{color:#69717c;font-size:.9em}}</style><main><a href='/'>â Workforce dashboard</a><h1>{esc(g['title'])}</h1><section><b>Version:</b> {APP_VERSION} Â· <b>Status:</b> {esc(g['status'])}<br><b>Budget:</b> ${g['spent']:.4f}/${g['budget']:.2f} Â· <b>Replans:</b> {g['replan_count']}/{g['max_replans']}</section>{retry}<section><h2>CEO plan</h2><pre>{esc(g['plan_json'] or 'Planning in progress...')}</pre></section><section><h2>Task execution</h2>{th}</section><section><h2>Evaluator</h2>{eh}</section><section><h2>Agent handoffs</h2>{hh}</section><section><h2>Evidence / sources</h2>{sh}</section><section><h2>Final output</h2><pre>{esc(g['final_output'] or 'Verification/report in progress...')}</pre></section><section><h2>Activity</h2>{ac}</section></main>{refresh}"""
 
 @app.get("/api/goals/{gid}")
 def api_goal(request:Request,gid:str):
