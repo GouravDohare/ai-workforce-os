@@ -5,7 +5,7 @@ from fastapi import FastAPI,Request,HTTPException
 from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse
 from openai import OpenAI
 
-APP_VERSION='0.4.4'; SCHEMA_VERSION='044-1'; DB=os.getenv('WORKFORCE_DB','workforce_v044.db')
+APP_VERSION='0.4.5'; SCHEMA_VERSION='045-1'; DB=os.getenv('WORKFORCE_DB','workforce_v045.db')
 MODEL=os.getenv('OPENAI_MODEL','gpt-5-mini'); WEB=os.getenv('ENABLE_WEB_RESEARCH','true').lower()=='true'
 TIMEOUT=float(os.getenv('OPENAI_TIMEOUT_SECONDS','120')); DEFAULT_BUDGET=float(os.getenv('DEFAULT_GOAL_BUDGET_USD','5'))
 MAX_BUDGET=float(os.getenv('MAX_GOAL_BUDGET_USD','25')); DAILY_CAP=float(os.getenv('GLOBAL_DAILY_SPEND_CAP_USD','20'))
@@ -30,7 +30,10 @@ def q(s,p=(),one=False):
 def x(s,p=()):
  with lock:
   c=db()
-  try:r=c.execute(s,p);c.commit();return r.lastrowid
+  try:
+   r=c.execute(s,p);c.commit();return r.lastrowid
+  except Exception:
+   c.rollback();raise
   finally:c.close()
 def esc(s):return str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
 
@@ -109,9 +112,22 @@ def pj(s):
 
 def reserve(gid,tid,amount):
  with lock:
-  c=db();c.execute('BEGIN IMMEDIATE');g=c.execute('SELECT budget,spent FROM goals WHERE id=?',(gid,)).fetchone();active=c.execute("SELECT COALESCE(SUM(amount),0) v FROM reservations WHERE goal_id=? AND status='reserved'",(gid,)).fetchone()['v'];day=(datetime.now(timezone.utc)-timedelta(days=1)).isoformat();daily=c.execute('SELECT COALESCE(SUM(amount),0) v FROM ledger WHERE created_at>=?',(day,)).fetchone()['v']
-  if float(g['spent'])+float(active)+amount>g['budget']+1e-9 or float(daily)+amount>DAILY_CAP:c.rollback();c.close();raise RuntimeError('budget reservation exceeded')
-  rid=uid('res');c.execute('INSERT INTO reservations VALUES(?,?,?,?,?,?)',(rid,gid,tid,amount,'reserved',now()));c.commit();c.close();return rid
+  c=db()
+  try:
+   c.execute('BEGIN IMMEDIATE')
+   g=c.execute('SELECT budget,spent FROM goals WHERE id=?',(gid,)).fetchone()
+   if not g: raise RuntimeError('goal not found during budget reservation')
+   active=c.execute("SELECT COALESCE(SUM(amount),0) v FROM reservations WHERE goal_id=? AND status='reserved'",(gid,)).fetchone()['v']
+   day=(datetime.now(timezone.utc)-timedelta(days=1)).isoformat()
+   daily=c.execute('SELECT COALESCE(SUM(amount),0) v FROM ledger WHERE created_at>=?',(day,)).fetchone()['v']
+   if float(g['spent'])+float(active)+amount>g['budget']+1e-9 or float(daily)+amount>DAILY_CAP:
+    raise RuntimeError('budget reservation exceeded')
+   rid=uid('res')
+   c.execute('INSERT INTO reservations(id,goal_id,task_id,amount,status,created_at,settled_at) VALUES(?,?,?,?,?,?,?)',(rid,gid,tid,amount,'reserved',now(),None))
+   c.commit();return rid
+  except Exception:
+   c.rollback();raise
+  finally:c.close()
 def settle(res,gid,tid,amount):
  if not res:return
  with lock:
@@ -183,7 +199,7 @@ def task_run(rid,tid):
  inst=q('SELECT * FROM instances WHERE id=?',(t['instance_id'],),one=True);ag=q('SELECT * FROM agents WHERE id=?',(inst['agent_id'],),one=True)
  for n in range(1,int(t['max_attempts'])+1):
   strategy='normal' if n==1 else 'compact';x('UPDATE tasks SET status=?,attempts=?,updated_at=? WHERE id=?',('running',n,now(),tid));aid=uid('att');st=time.time();x('INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(aid,tid,n,'started',now(),None,None,0,0,0,MODEL,None,None,None,strategy,'web_search' if t['requires_web'] else 'none'))
-  prompt=f"""You are {ag['name']}. {ag['instructions']}\nOBJECTIVE: {context(rid,t)['objective']}\nDESCRIPTION: {context(rid,t)['description']}\nCRITERIA: {context(rid,t)['criteria']}\nTASK: {t['title']} — {t['instructions']}\nCONTRACT: {jd(jl(t['contract']))}\nUPSTREAM: {jd(context(rid,t)['dependencies'])}\nEVIDENCE: {jd(context(rid,t)['evidence'])}\nMEMORY: {jd(context(rid,t)['memory'])}\nNever fabricate facts, citations, URLs or calculations. Return ONLY the worker JSON schema."""
+  prompt=f"""You are {ag['name']}. {ag['instructions']}\nOBJECTIVE: {context(rid,t)['objective']}\nDESCRIPTION: {context(rid,t)['description']}\nCRITERIA: {context(rid,t)['criteria']}\nTASK: {t['title']} â {t['instructions']}\nCONTRACT: {jd(jl(t['contract']))}\nUPSTREAM: {jd(context(rid,t)['dependencies'])}\nEVIDENCE: {jd(context(rid,t)['evidence'])}\nMEMORY: {jd(context(rid,t)['memory'])}\nNever fabricate facts, citations, URLs or calculations. Return ONLY the worker JSON schema."""
   if strategy=='compact':prompt+=' Be concise and satisfy only the contract.'
   try:
    o=call(rid,tid,'task',prompt,MODEL,bool(t['requires_web']),('worker_output',WORKER),2200);d=pj(o['text']);ev=evidence(rid,tid,o['r']);claims=d.get('claims',[]);supported=sum(bool(c.get('evidence_ids')) for c in claims);conf=max(.1,min(1,.6*supported/max(1,len(claims))+.4*(1-min(.8,.04*len(d.get('unknowns',[]))))));a=None
@@ -307,11 +323,11 @@ def dw():
  except Exception as e:return JSONResponse({'status':'failed','version':APP_VERSION,'error_type':classify(e),'message':str(e)},502)
 @app.get('/')
 def home(request:Request):
- cards=''.join(f"<div class='card'><b>{esc(g['title'])}</b> <span class='badge'>{esc(g['status'])}</span><div class='muted'>v{APP_VERSION} · ${g['spent']:.4f}/${g['budget']:.2f} · verification {esc(g['verification_status'] or '—')}</div><a href='/goals/{g['id']}'>Open</a></div>" for g in q('SELECT * FROM goals ORDER BY created_at DESC LIMIT 25'))
+ cards=''.join(f"<div class='card'><b>{esc(g['title'])}</b> <span class='badge'>{esc(g['status'])}</span><div class='muted'>v{APP_VERSION} Â· ${g['spent']:.4f}/${g['budget']:.2f} Â· verification {esc(g['verification_status'] or 'â')}</div><a href='/goals/{g['id']}'>Open</a></div>" for g in q('SELECT * FROM goals ORDER BY created_at DESC LIMIT 25'))
  signed=bool(AUTH and request.cookies.get('awos_session')==AUTH)
  session_html=("<form method='post' action='/logout'><button>Sign out</button></form>" if signed else ("<a href='/login'>Sign in to run objectives</a>" if AUTH else ""))
  form=(f"<form method='post' action='/goals'><input name='title' required placeholder='Objective title'><textarea name='description' required placeholder='What should the workforce accomplish?'></textarea><textarea name='criteria' placeholder='Success criteria'></textarea><input name='budget' type='number' step='.01' placeholder='Budget USD'><button>Create & run</button></form>" if (not AUTH or signed) else "<p class='warning'>Private beta is enabled. Sign in before creating or running objectives.</p>")
- return HTMLResponse(f"<!doctype html><html><head><meta charset='utf-8'><style>{CSS}</style></head><body><main><h1>AI Workforce OS</h1><p class='muted'>v{APP_VERSION} · schema {SCHEMA_VERSION}</p><div class='card'>{session_html}{form}</div><h2>Objectives</h2>{cards or 'None yet.'}</main></body></html>")
+ return HTMLResponse(f"<!doctype html><html><head><meta charset='utf-8'><style>{CSS}</style></head><body><main><h1>AI Workforce OS</h1><p class='muted'>v{APP_VERSION} Â· schema {SCHEMA_VERSION}</p><div class='card'>{session_html}{form}</div><h2>Objectives</h2>{cards or 'None yet.'}</main></body></html>")
 @app.post('/goals')
 async def create(request:Request):
  auth(request);ct=request.headers.get('content-type','');d=await request.json() if 'application/json' in ct else dict(await request.form());title=str(d.get('title',''));desc=str(d.get('description',''));criteria=str(d.get('criteria',''));b=float(d.get('budget') or DEFAULT_BUDGET)
@@ -322,7 +338,7 @@ async def create(request:Request):
 def page(gid,request:Request):
  auth(request);g=gro(gid)
  html="""<!doctype html><html><head><meta charset='utf-8'><style>%s</style></head><body><main><a href='/'>Back</a><h1>%s</h1><div id='a'>Loading...</div></main><script>
-async function refresh(){const rr=await fetch('/api/goals/%s',{credentials:'same-origin'});if(!rr.ok){document.getElementById('a').innerHTML='<div class="card error"><b>Could not load run</b><p>HTTP '+rr.status+'</p></div>';return}const d=await rr.json(),g=d.goal;let h='<div class="card"><b>Status:</b> '+g.status+' · <b>Spend:</b> $'+Number(g.spent).toFixed(4)+' / $'+Number(g.budget).toFixed(2)+' · <b>Verification:</b> '+(g.verification_status||'—')+'<br>Planner: '+(g.planner_degraded?'DEGRADED FALLBACK':'structured')+'</div>';h+='<div class="card"><h2>Task graph</h2>'+d.tasks.map(t=>'<div class="task"><b>'+t.title+'</b> <span class="badge">'+t.status+'</span><div class="muted">attempts '+t.attempts+' · spend $'+Number(t.spent).toFixed(4)+' · confidence '+(t.confidence??'—')+'</div>'+(t.error_message?'<div class="error">'+t.error_message+'</div>':'')+'</div>').join('')+'</div>';h+='<div class="card"><h2>Evidence</h2>'+(d.evidence.map(e=>'<div class="task"><b>'+(e.title||'Source')+'</b><br>'+(e.url?'<a target="_blank" href="'+e.url+'">'+e.url+'</a>':'')+'</div>').join('')||'No evidence yet.')+'</div>';if(g.final_output)h+='<div class="card"><h2>Final output</h2><pre>'+g.final_output+'</pre></div>';if(['failed','incomplete','interrupted'].includes(g.status))h+='<form method="post" action="/goals/%s/retry"><button>Retry</button></form>';document.getElementById('a').innerHTML=h;if(['queued','planning','executing','evaluating','replanning'].includes(g.status))setTimeout(refresh,3000)}refresh();</script></body></html>"""%(CSS,esc(g['title']),gid,gid)
+async function refresh(){const rr=await fetch('/api/goals/%s',{credentials:'same-origin'});if(!rr.ok){document.getElementById('a').innerHTML='<div class="card error"><b>Could not load run</b><p>HTTP '+rr.status+'</p></div>';return}const d=await rr.json(),g=d.goal;let h='<div class="card"><b>Status:</b> '+g.status+' Â· <b>Spend:</b> $'+Number(g.spent).toFixed(4)+' / $'+Number(g.budget).toFixed(2)+' Â· <b>Verification:</b> '+(g.verification_status||'â')+'<br>Planner: '+(g.planner_degraded?'DEGRADED FALLBACK':'structured')+'</div>';h+='<div class="card"><h2>Task graph</h2>'+d.tasks.map(t=>'<div class="task"><b>'+t.title+'</b> <span class="badge">'+t.status+'</span><div class="muted">attempts '+t.attempts+' Â· spend $'+Number(t.spent).toFixed(4)+' Â· confidence '+(t.confidence??'â')+'</div>'+(t.error_message?'<div class="error">'+t.error_message+'</div>':'')+'</div>').join('')+'</div>';h+='<div class="card"><h2>Evidence</h2>'+(d.evidence.map(e=>'<div class="task"><b>'+(e.title||'Source')+'</b><br>'+(e.url?'<a target="_blank" href="'+e.url+'">'+e.url+'</a>':'')+'</div>').join('')||'No evidence yet.')+'</div>';if(g.final_output)h+='<div class="card"><h2>Final output</h2><pre>'+g.final_output+'</pre></div>';if(['failed','incomplete','interrupted'].includes(g.status))h+='<form method="post" action="/goals/%s/retry"><button>Retry</button></form>';document.getElementById('a').innerHTML=h;if(['queued','planning','executing','evaluating','replanning'].includes(g.status))setTimeout(refresh,3000)}refresh();</script></body></html>"""%(CSS,esc(g['title']),gid,gid)
  return HTMLResponse(html)
 @app.get('/api/goals/{gid}')
 def api(gid,request:Request):
