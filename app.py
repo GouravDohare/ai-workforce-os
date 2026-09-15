@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.6"
+APP_VERSION = "0.4.7"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -22,6 +22,8 @@ OUTPUT_PRICE = float(os.getenv("OPENAI_OUTPUT_PRICE_PER_MTOK", "2"))
 MAX_CONCURRENT_GOALS = int(os.getenv("MAX_CONCURRENT_GOALS", "1"))
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
 RUN_TIMEOUT = float(os.getenv("RUN_TIMEOUT_SECONDS", "900"))
+PLANNER_TIMEOUT = float(os.getenv("PLANNER_TIMEOUT_SECONDS", "75"))
+MODEL_CALL_TIMEOUT = float(os.getenv("MODEL_CALL_TIMEOUT_SECONDS", "150"))
 
 app = FastAPI(title="AI Workforce OS", version=APP_VERSION)
 lock = threading.RLock()
@@ -230,16 +232,21 @@ def event(rid,kind,message,payload=None,tid=None):
     g=q("SELECT goal_id FROM runs WHERE id=?",(rid,),one=True)
     x("INSERT INTO events(id,run_id,goal_id,task_id,kind,message,payload,created_at) VALUES(?,?,?,?,?,?,?,?)",(uid("ev"),rid,g["goal_id"] if g else None,tid,kind,message,jd(payload or {}),now()))
 
-def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,spend_cap=None,search_context="low"):
+def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,spend_cap=None,search_context="low",timeout_override=None):
     gid=get_goal_from_run(rid)["id"]
     estimated=price(math.ceil(len(prompt)/4),tokens)
     if spend_cap is not None: estimated=min(estimated,max(.01,float(spend_cap)))
     res=reserve(gid,tid,estimated)
     cid=uid("mc"); st=time.time()
-    x("INSERT INTO model_calls(id,run_id,task_id,purpose,model,tool_mode,status,started_at,ended_at,latency_ms,input_tokens,output_tokens,cost,request_id,error_type,error_message,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,rid,tid,purpose,model,"web_search" if web else "none","started",now(),None,None,0,0,0,None,None,None,jd({"estimated_cost":estimated})))
+    call_timeout=float(timeout_override or MODEL_CALL_TIMEOUT or TIMEOUT)
+    x("INSERT INTO model_calls(id,run_id,task_id,purpose,model,tool_mode,status,started_at,ended_at,latency_ms,input_tokens,output_tokens,cost,request_id,error_type,error_message,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,rid,tid,purpose,model,"web_search" if web else "none","started",now(),None,None,0,0,0,None,None,None,jd({"estimated_cost":estimated,"timeout_seconds":call_timeout})))
+    event(rid,"MODEL_STARTED",purpose,{"model":model,"web":web,"timeout_seconds":call_timeout,"max_output_tokens":tokens},tid)
+    print(f"MODEL_STARTED run={rid} task={tid} purpose={purpose} model={model} web={web} timeout={call_timeout}s",flush=True)
     try:
-        client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"),timeout=TIMEOUT,max_retries=0)
+        client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"),timeout=call_timeout,max_retries=0)
         kw={"model":model,"input":prompt,"max_output_tokens":tokens}
+        if not web:
+            kw["reasoning"]={"effort":"minimal"}
         if schema:
             kw["text"]={"format":{"type":"json_schema","name":schema[0],"schema":schema[1],"strict":True}}
         if web:
@@ -256,11 +263,14 @@ def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,sp
         x("UPDATE model_calls SET status='completed',ended_at=?,latency_ms=?,input_tokens=?,output_tokens=?,cost=?,request_id=? WHERE id=?",(now(),el,i,o,cc,getattr(r,"id",None),cid))
         settle(res,gid,tid,cc)
         event(rid,"MODEL_COMPLETED",purpose,{"latency_ms":el,"cost":cc,"request_id":getattr(r,"id",None)},tid)
+        print(f"MODEL_COMPLETED run={rid} task={tid} purpose={purpose} latency_ms={el} cost={cc:.6f} request_id={getattr(r,'id',None)}",flush=True)
         return {"r":r,"text":s,"i":i,"o":o,"cost":cc,"id":getattr(r,"id",None)}
     except Exception as e:
         release(res)
         x("UPDATE model_calls SET status='failed',ended_at=?,latency_ms=?,error_type=?,error_message=? WHERE id=?",(now(),int((time.time()-st)*1000),classify(e),str(e),cid))
-        event(rid,"MODEL_FAILED",purpose,{"error_type":classify(e),"error":str(e)},tid)
+        el=int((time.time()-st)*1000)
+        event(rid,"MODEL_FAILED",purpose,{"error_type":classify(e),"error":str(e),"latency_ms":el},tid)
+        print(f"MODEL_FAILED run={rid} task={tid} purpose={purpose} latency_ms={el} error_type={classify(e)} error={e}",flush=True)
         raise
 
 # Strict schemas: every object property is required, with nullable values where optional data is needed.
@@ -506,13 +516,29 @@ def replans(rid,items):
     return n
 
 def execute(rid):
+    run_started=time.time()
     try:
         g=get_goal_from_run(rid)
+        event(rid,"RUN_STARTED","goal execution started",{"run_timeout_seconds":RUN_TIMEOUT})
+        print(f"RUN_STARTED run={rid} goal={g['id']} deadline={RUN_TIMEOUT}s",flush=True)
         x("UPDATE runs SET status='planning',started_at=? WHERE id=?",(now(),rid));x("UPDATE goals SET status='planning' WHERE id=?",(g["id"],))
+        event(rid,"PLANNER_STARTED","CEO planner stage started",{"timeout_seconds":PLANNER_TIMEOUT,"model":MODEL})
+        print(f"PLANNER_STARTED run={rid} goal={g['id']} timeout={PLANNER_TIMEOUT}s",flush=True)
         try:
-            p=call(rid,None,"planner",f"Create the minimum sufficient workforce for OBJECTIVE {g['title']} / {g['description']} CRITERIA {g['criteria']} BUDGET ${g['budget']}. Use explicit dependencies, contracts, web tools for current facts, verification and uncertainty. Return only plan JSON.",MODEL,False,("ceo_plan",PLAN),5000,min(1.0,g["budget"]*.18))
+            planner_prompt=f"""Act as the CEO/orchestrator. Build the MINIMUM sufficient workforce for this objective.
+OBJECTIVE: {g['title']}
+DESCRIPTION: {g['description']}
+SUCCESS CRITERIA: {g['criteria']}
+BUDGET: ${g['budget']}
+Return ONLY the required plan JSON. Keep it compact: normally 3-6 agents and 4-8 tasks.
+Every task must have a clear owner, explicit dependencies, a machine-readable contract, a realistic positive budget, and a short instruction. Do not create unnecessary agents or tasks. Use web research only where current external facts are genuinely required. Separate research from synthesis and verification."""
+            p=call(rid,None,"planner",planner_prompt,MODEL,False,("ceo_plan",PLAN),2800,min(1.0,g["budget"]*.18),timeout_override=PLANNER_TIMEOUT)
             plan=parse_json(p["text"]);valid_plan(plan,float(g["budget"]));degraded=0
+            event(rid,"PLANNER_COMPLETED","CEO planner produced a valid structured plan",{"agents":len(plan["agents"]),"tasks":len(plan["tasks"])})
+            print(f"PLANNER_COMPLETED run={rid} agents={len(plan['agents'])} tasks={len(plan['tasks'])}",flush=True)
         except Exception as e:
+            event(rid,"PLANNER_FAILED","CEO planner failed; switching to deterministic fallback",{"error_type":classify(e),"error":str(e)})
+            print(f"PLANNER_FAILED run={rid} error_type={classify(e)} error={e}",flush=True)
             plan=fallback(g);valid_plan(plan,float(g["budget"]));degraded=1;event(rid,"PLANNER_DEGRADED","safe fallback planner used",{"error":str(e)})
         x("UPDATE goals SET plan=?,planner_degraded=?,updated_at=? WHERE id=?",(jd(plan),degraded,now(),g["id"]))
         roles={}
@@ -527,7 +553,9 @@ def execute(rid):
         for t in plan["tasks"]:
             for d,cnd in zip(t["depends_on"],t["dependency_conditions"]):
                 x("INSERT INTO deps(id,run_id,upstream,downstream,condition,required,created_at) VALUES(?,?,?,?,?,?,?)",(uid("dep"),rid,ids[d],ids[t["id"]],cnd,1,now()))
-        x("UPDATE runs SET status='executing' WHERE id=?",(rid,));x("UPDATE goals SET status='executing' WHERE id=?",(g["id"],));schedule(rid)
+        event(rid,"TASKS_CREATED","plan materialized into executable task graph",{"count":len(plan["tasks"])})
+        print(f"TASKS_CREATED run={rid} count={len(plan['tasks'])}",flush=True)
+        x("UPDATE runs SET status='executing' WHERE id=?",(rid,));x("UPDATE goals SET status='executing' WHERE id=?",(g["id"],));event(rid,"SCHEDULER_STARTED","dependency scheduler started");schedule(rid)
         if runrow(rid)["status"] in {"incomplete","cancelled"}:return
         ev=evaluate(rid,"post_execution")
         if ev["ok"] and not ev["passed"] and g["replan_count"]<g["max_replans"]:
@@ -536,6 +564,8 @@ def execute(rid):
         if not ev["ok"] or not ev["passed"]:
             x("UPDATE goals SET status='incomplete',verification_status=?,updated_at=? WHERE id=?",("unavailable" if not ev["ok"] else "failed",now(),g["id"]))
             x("UPDATE runs SET status='incomplete',reason=?,ended_at=? WHERE id=?",(ev.get("error","verification failed"),now(),rid));return
+        if time.time()-run_started > RUN_TIMEOUT:
+            raise RuntimeError("run deadline exceeded before final report")
         ts=q("SELECT * FROM tasks WHERE run_id=? AND status='completed'",(rid,))
         report=call(rid,None,"report",f"Write the final decision-ready report for {g['title']}. Criteria: {g['criteria']} VERIFIED TASKS: {jd([{'title':t['title'],'output':t['output'],'structured':jl(t['structured'])} for t in ts])} EVIDENCE: {jd([dict(e) for e in q('SELECT id,title,url,publisher FROM evidence WHERE run_id=?',(rid,))])}. Never invent facts.",MODEL,False,None,3500,min(1.0,g["budget"]*.18))["text"]
         x("UPDATE goals SET final_output=?,status='completed',verification_status='passed',updated_at=? WHERE id=?",(report,now(),g["id"]))
@@ -545,6 +575,7 @@ def execute(rid):
         try:
             g=get_goal_from_run(rid);x("UPDATE goals SET status='incomplete',verification_status='system_error',updated_at=? WHERE id=?",(now(),g["id"]));x("UPDATE runs SET status='incomplete',reason=?,ended_at=? WHERE id=?",(str(e),now(),rid))
         except Exception: pass
+        print(f"RUN_INCOMPLETE run={rid} error={e}",flush=True)
 
 def start(gid):
     active=q("SELECT id FROM runs WHERE goal_id=? AND status IN ('queued','planning','executing','evaluating','replanning') LIMIT 1",(gid,),one=True)
@@ -591,7 +622,7 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
 def dg():
@@ -612,6 +643,15 @@ def ddb(request:Request):
     auth(request)
     c=db();tables=[r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()];cols={t:table_columns(c,t) for t in tables};compatible=schema_ok(c) if 'goals' in cols else False;c.close()
     return {"status":"ok","version":APP_VERSION,"schema_version":SCHEMA_VERSION,"db":DB,"tables":tables,"goals_columns":cols.get("goals",[]),"tasks_columns":cols.get("tasks",[]),"reservations_columns":cols.get("reservations",[]),"schema_compatible":compatible}
+
+@app.get("/diagnostics/run/{rid}")
+def drun(rid,request:Request):
+    auth(request)
+    r=runrow(rid); g=get_goal_from_run(rid)
+    ev=q("SELECT kind,message,payload,created_at,task_id FROM events WHERE run_id=? ORDER BY created_at DESC LIMIT 40",(rid,))
+    mc=q("SELECT purpose,status,model,tool_mode,started_at,ended_at,latency_ms,input_tokens,output_tokens,cost,request_id,error_type,error_message FROM model_calls WHERE run_id=? ORDER BY started_at DESC LIMIT 20",(rid,))
+    ts=q("SELECT id,title,status,attempts,error_type,error_message,updated_at FROM tasks WHERE run_id=? ORDER BY created_at",(rid,))
+    return {"status":"ok","version":APP_VERSION,"run":dict(r),"goal":{"id":g["id"],"title":g["title"],"status":g["status"],"spent":g["spent"],"budget":g["budget"]},"events":[dict(e) for e in ev],"model_calls":[dict(m) for m in mc],"tasks":[dict(t) for t in ts]}
 
 @app.get("/")
 def home(request:Request):
