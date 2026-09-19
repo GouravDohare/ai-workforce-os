@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.10"
+APP_VERSION = "0.4.12"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -21,6 +21,17 @@ INPUT_PRICE = float(os.getenv("OPENAI_INPUT_PRICE_PER_MTOK", ".25"))
 OUTPUT_PRICE = float(os.getenv("OPENAI_OUTPUT_PRICE_PER_MTOK", "2"))
 MAX_CONCURRENT_GOALS = int(os.getenv("MAX_CONCURRENT_GOALS", "1"))
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
+MAX_CONCURRENT_MODEL_CALLS = int(os.getenv("MAX_CONCURRENT_MODEL_CALLS", "1"))
+MODEL_RETRY_COUNT = int(os.getenv("MODEL_RETRY_COUNT", "1"))
+RATE_LIMIT_BACKOFF_SECONDS = float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "6"))
+WEB_MODEL = os.getenv("OPENAI_WEB_MODEL", "gpt-4.1-mini")
+WEB_INPUT_PRICE = float(os.getenv("OPENAI_WEB_INPUT_PRICE_PER_MTOK", ".40"))
+WEB_OUTPUT_PRICE = float(os.getenv("OPENAI_WEB_OUTPUT_PRICE_PER_MTOK", "1.60"))
+MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "24000"))
+MAX_EVIDENCE_ITEMS = int(os.getenv("MAX_EVIDENCE_ITEMS", "12"))
+MAX_UPSTREAM_CHARS = int(os.getenv("MAX_UPSTREAM_CHARS", "7000"))
+MAX_WEB_MEMO_CHARS = int(os.getenv("MAX_WEB_MEMO_CHARS", "8000"))
+MAX_MODEL_REQUEST_ESTIMATED_TOKENS = int(os.getenv("MAX_MODEL_REQUEST_ESTIMATED_TOKENS", "24000"))
 SCHEDULER_POLL_SECONDS = float(os.getenv("SCHEDULER_POLL_SECONDS", "0.5"))
 MAX_TASKS = int(os.getenv("MAX_TASKS", "16"))
 TASK_BUDGET_FRACTION = float(os.getenv("TASK_BUDGET_FRACTION", "0.70"))
@@ -28,13 +39,14 @@ RUN_TIMEOUT = float(os.getenv("RUN_TIMEOUT_SECONDS", "900"))
 PLANNER_TIMEOUT = float(os.getenv("PLANNER_TIMEOUT_SECONDS", "75"))
 MODEL_CALL_TIMEOUT = float(os.getenv("MODEL_CALL_TIMEOUT_SECONDS", "150"))
 RESEARCH_TIMEOUT = float(os.getenv("RESEARCH_TIMEOUT_SECONDS", "180"))
-RESEARCH_INITIAL_TOKENS = int(os.getenv("RESEARCH_INITIAL_TOKENS", "6000"))
-RESEARCH_ESCALATED_TOKENS = int(os.getenv("RESEARCH_ESCALATED_TOKENS", "8000"))
+RESEARCH_INITIAL_TOKENS = int(os.getenv("RESEARCH_INITIAL_TOKENS", "1200"))
+RESEARCH_ESCALATED_TOKENS = int(os.getenv("RESEARCH_ESCALATED_TOKENS", "1600"))
 
 app = FastAPI(title="AI Workforce OS", version=APP_VERSION)
 lock = threading.RLock()
 goal_pool = ThreadPoolExecutor(max_workers=max(1, MAX_CONCURRENT_GOALS))
 task_pool = ThreadPoolExecutor(max_workers=max(1, MAX_CONCURRENT_TASKS))
+model_semaphore = threading.Semaphore(max(1, MAX_CONCURRENT_MODEL_CALLS))
 
 uid = lambda p: f"{p}_{uuid.uuid4().hex[:14]}"
 now = lambda: datetime.now(timezone.utc).isoformat()
@@ -100,9 +112,19 @@ def canonical_condition(value):
     aliases = {
         "completed":"completed", "complete":"completed", "done":"completed",
         "success":"completed", "successful":"completed", "succeeded":"completed",
+        "provided":"completed", "outputprovided":"completed", "outputsprovided":"completed",
+        "available":"completed", "outputsavailable":"completed", "resultprovided":"completed",
+        "finished":"completed", "ready":"completed",
         "optional":"optional", "optionally":"optional"
     }
-    return aliases.get(v)
+    if v in aliases:
+        return aliases[v]
+    # Planners sometimes encode the dependency itself in prose, e.g.
+    # "T1 outputs provided". The DAG already stores the upstream task ID, so
+    # the runtime condition is simply that the upstream task completed.
+    if re.search(r"(?:provided|available|ready|complete|completed|finished|done|successful|succeeded)$", v):
+        return "completed"
+    return None
 
 
 def table_columns(c, table):
@@ -192,6 +214,11 @@ def get_goal_from_run(rid): return gro(runrow(rid)["goal_id"])
 def classify(e):
     s=str(e).lower()
     if "budget" in s: return "budget"
+    if "rate limit" in s or "rate_limit_exceeded" in s or "429" in s:
+        m=re.search(r"requested\s+(\d+)", s)
+        if m and int(m.group(1)) > MAX_MODEL_REQUEST_ESTIMATED_TOKENS:
+            return "strategy"
+        return "transient"
     if "cancel" in s: return "cancelled"
     if any(k in s for k in ["timeout","timed out","429","502","503","connection","temporar"]): return "transient"
     if "api key" in s or "authentication" in s or "invalid model" in s or "permission" in s: return "permanent"
@@ -212,7 +239,23 @@ def usage(r):
     u=getattr(r,"usage",None)
     return int(getattr(u,"input_tokens",0) or 0), int(getattr(u,"output_tokens",0) or 0)
 
-def price(i,o): return i/1e6*INPUT_PRICE + o/1e6*OUTPUT_PRICE
+def price(i,o,model=None):
+    if model == WEB_MODEL:
+        return i/1e6*WEB_INPUT_PRICE + o/1e6*WEB_OUTPUT_PRICE
+    return i/1e6*INPUT_PRICE + o/1e6*OUTPUT_PRICE
+
+def clip(value, limit):
+    text=display_text(value)
+    if len(text) <= limit: return text
+    head=max(200, int(limit*0.68)); tail=max(100, limit-head-80)
+    return text[:head] + "\n...[truncated for context safety]...\n" + text[-tail:]
+
+def compact_json(value, limit):
+    return clip(jd(value), limit)
+
+def prompt_token_estimate(prompt, output_tokens):
+    return math.ceil(len(prompt)/4) + int(output_tokens)
+
 
 def parse_json(s):
     try: return json.loads(s)
@@ -261,9 +304,24 @@ def event(rid,kind,message,payload=None,tid=None):
     g=q("SELECT goal_id FROM runs WHERE id=?",(rid,),one=True)
     x("INSERT INTO events(id,run_id,goal_id,task_id,kind,message,payload,created_at) VALUES(?,?,?,?,?,?,?,?)",(uid("ev"),rid,g["goal_id"] if g else None,tid,kind,message,jd(payload or {}),now()))
 
+def retry_delay(exc, attempt):
+    msg=str(exc)
+    m=re.search(r"try again in\s+([0-9.]+)s", msg, re.I)
+    if m:
+        try: return max(1.0, min(30.0, float(m.group(1))+0.5))
+        except Exception: pass
+    return max(1.0, min(30.0, RATE_LIMIT_BACKOFF_SECONDS*(2**attempt)))
+
+def extract_text_urls(text):
+    urls=[]
+    for u in re.findall(r"https?://[^\s<>\"']+", str(text or "")):
+        u=u.rstrip(".,);]}")
+        if u not in urls: urls.append(u)
+    return urls
+
 def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,spend_cap=None,search_context="low",timeout_override=None):
     gid=get_goal_from_run(rid)["id"]
-    estimated=price(math.ceil(len(prompt)/4),tokens)
+    estimated=price(math.ceil(len(prompt)/4),tokens,model)
     if spend_cap is not None:
         # Reserve the declared call cap rather than a potentially optimistic token estimate.
         # This makes the goal budget a real reservation boundary.
@@ -271,6 +329,10 @@ def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,sp
     res=reserve(gid,tid,estimated)
     cid=uid("mc"); st=time.time()
     call_timeout=float(timeout_override or MODEL_CALL_TIMEOUT or TIMEOUT)
+    estimated_request_tokens=prompt_token_estimate(prompt,tokens)
+    if estimated_request_tokens > MAX_MODEL_REQUEST_ESTIMATED_TOKENS:
+        release(res)
+        raise RuntimeError(f"strategy_error:model request too large: estimated {estimated_request_tokens} tokens")
     x("INSERT INTO model_calls(id,run_id,task_id,purpose,model,tool_mode,status,started_at,ended_at,latency_ms,input_tokens,output_tokens,cost,request_id,error_type,error_message,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,rid,tid,purpose,model,"web_search" if web else "none","started",now(),None,None,0,0,0,None,None,None,jd({"estimated_cost":estimated,"timeout_seconds":call_timeout})))
     event(rid,"MODEL_STARTED",purpose,{"model":model,"web":web,"timeout_seconds":call_timeout,"max_output_tokens":tokens},tid)
     print(f"MODEL_STARTED run={rid} task={tid} purpose={purpose} model={model} web={web} timeout={call_timeout}s",flush=True)
@@ -284,14 +346,32 @@ def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,sp
         if web:
             if not WEB: raise RuntimeError("web_search disabled")
             kw["tools"]=[{"type":"web_search","search_context_size":search_context}]
-            kw["tool_choice"]="auto"
+            # Research tasks require actual search; auto may legitimately return no tool call.
+            kw["tool_choice"]="required"
             kw["include"]=["web_search_call.action.sources"]
-        r=client.responses.create(**kw)
+        with model_semaphore:
+            last=None
+            for attempt in range(MODEL_RETRY_COUNT+1):
+                try:
+                    r=client.responses.create(**kw)
+                    break
+                except Exception as e:
+                    last=e
+                    if "429" not in str(e) and "rate_limit_exceeded" not in str(e).lower():
+                        raise
+                    if attempt >= MODEL_RETRY_COUNT:
+                        raise
+                    delay=retry_delay(e,attempt)
+                    event(rid,"RATE_LIMIT_BACKOFF","provider rate limit reached; backing off before retry",{"attempt":attempt+1,"delay_seconds":delay,"model":model},tid)
+                    print(f"RATE_LIMIT_BACKOFF run={rid} task={tid} model={model} delay={delay}s",flush=True)
+                    time.sleep(delay)
+            if last is not None and 'r' not in locals():
+                raise last
         s=response_text(r); i,o=usage(r)
         if getattr(r,"status",None)=="incomplete": raise RuntimeError("incomplete_output:"+str(getattr(getattr(r,"incomplete_details",None),"reason",None)))
         if getattr(r,"status",None) in {"failed","cancelled"}: raise RuntimeError("response_status:"+str(getattr(r,"status",None)))
         if not s: raise RuntimeError("empty output")
-        cc=price(i,o); el=int((time.time()-st)*1000)
+        cc=price(i,o,model); el=int((time.time()-st)*1000)
         if cc > estimated + 1e-6:
             # The provider has already charged the call; record the overrun explicitly
             # instead of pretending the declared cap was respected.
@@ -317,7 +397,7 @@ def research_call(rid, tid, prompt, model, spend_cap, timeout_override=None):
     one materially different retry: shorter instructions and a larger output ceiling.
     Other failures are left to the task-level retry classifier."""
     try:
-        return call(rid, tid, "web_research", prompt, model, True, None,
+        return call(rid, tid, "web_research", prompt, WEB_MODEL, True, None,
                     RESEARCH_INITIAL_TOKENS, spend_cap, timeout_override=(timeout_override or RESEARCH_TIMEOUT))
     except Exception as e:
         msg=str(e)
@@ -332,7 +412,7 @@ def research_call(rid, tid, prompt, model, spend_cap, timeout_override=None):
             "uncertainties, and source URLs. Use at most 12 bullets and avoid repeating source text.\n"
             + prompt
         )
-        return call(rid, tid, "web_research_escalated", compact, model, True, None,
+        return call(rid, tid, "web_research_escalated", compact, WEB_MODEL, True, None,
                     RESEARCH_ESCALATED_TOKENS, spend_cap, timeout_override=(timeout_override or RESEARCH_TIMEOUT))
 
 # Strict schemas: every object property is required, with nullable values where optional data is needed.
@@ -565,7 +645,18 @@ def extract_sources(r):
                 elif hasattr(v,"__dict__"):walk(vars(v))
             except Exception:pass
     walk(getattr(r,"output",[]))
-    uniq={z["url"]:z for z in found}
+    try:
+        dump=r.model_dump() if hasattr(r,"model_dump") else None
+        if dump: walk(dump.get("output",dump))
+    except Exception:
+        pass
+    for u in extract_text_urls(getattr(r,"output_text",None)):
+        found.append({"url":u,"title":u,"publisher":None})
+    uniq={}
+    for z in found:
+        u=z.get("url")
+        if not u: continue
+        if u not in uniq or (uniq[u].get("title")==u and z.get("title")!=u): uniq[u]=z
     return list(uniq.values())
 
 def save_sources(rid,tid,r):
@@ -586,10 +677,15 @@ def update_claim_evidence(rid,tid,d):
 
 def context(rid,t):
     g=get_goal_from_run(rid)
-    ds=q("SELECT d.*,u.title,u.status,u.output,u.structured FROM deps d JOIN tasks u ON u.id=d.upstream WHERE d.run_id=? AND d.downstream=?",(rid,t["id"]))
-    ev=q("SELECT id,title,url,publisher,claim,retrieved_at,confidence FROM evidence WHERE run_id=?",(rid,))
-    mem=q("SELECT type,key,value,confidence FROM memory WHERE company_id=? AND (goal_id=? OR goal_id IS NULL) ORDER BY updated_at DESC LIMIT 20",(g["company_id"],g["id"]))
-    return {"objective":g["title"],"description":g["description"],"criteria":g["criteria"],"task":{"title":t["title"],"instructions":t["instructions"],"contract":jl(t["contract"])},"dependencies":[dict(d) for d in ds],"evidence":[dict(e) for e in ev],"memory":[dict(m) for m in mem]}
+    ds=q("SELECT d.*,u.title,u.status,u.output,u.structured FROM deps d JOIN tasks u ON u.id=d.upstream WHERE d.run_id=? AND d.downstream=? ORDER BY d.id",(rid,t["id"]))
+    ev=q("SELECT id,title,url,publisher,claim,retrieved_at,confidence FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))
+    mem=q("SELECT type,key,value,confidence FROM memory WHERE company_id=? AND (goal_id=? OR goal_id IS NULL) ORDER BY updated_at DESC LIMIT 10",(g["company_id"],g["id"]))
+    deps=[]
+    for d in ds:
+        deps.append({"plan_id":d["upstream"],"title":d["title"],"status":d["status"],"output":clip(d["output"],MAX_UPSTREAM_CHARS),"structured":clip(jd(jl(d["structured"])),MAX_UPSTREAM_CHARS)})
+    evidence=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"claim":clip(e["claim"],500),"retrieved_at":e["retrieved_at"],"confidence":e["confidence"]} for e in ev]
+    memory=[{"type":m["type"],"key":m["key"],"value":clip(m["value"],700),"confidence":m["confidence"]} for m in mem]
+    return {"objective":clip(g["title"],500),"description":clip(g["description"],4000),"criteria":clip(g["criteria"],5000),"task":{"title":clip(t["title"],500),"instructions":clip(t["instructions"],4000),"contract":jl(t["contract"])},"dependencies":deps,"evidence":evidence,"memory":memory}
 
 def art(rid,tid,name,content,typ="text"):
     aid=uid("art"); v=q("SELECT COALESCE(MAX(version),0) v FROM artifacts WHERE run_id=? AND name=?",(rid,name),one=True)["v"]+1
@@ -662,10 +758,10 @@ def task_run(rid,tid):
                     web_call=research_call(rid,tid,research_prompt,MODEL,float(t["budget_limit"])*.55,task_timeout)
                     source_urls=[e["url"] for e in extract_sources(web_call["r"])]
                     save_sources(rid,tid,web_call["r"])
-                    if not source_urls and jl(t["contract"]).get("evidence_required"):
-                        raise RuntimeError("strategy_error:no sources returned by web research")
-                    transform_prompt=base+f"\nWEB RESEARCH MEMO:\n{web_call['text']}\nSOURCE URLS AVAILABLE:\n{jd(source_urls)}\nConvert this into the required worker JSON. Use only source URLs from the available list; do not invent URLs."
-                    o=call(rid,tid,"task_structuring",transform_prompt,MODEL,False,("worker_output",WORKER),2200,float(t["budget_limit"])*.45,timeout_override=task_timeout)
+                    if not source_urls:
+                        event(rid,"RESEARCH_NO_SOURCE_METADATA","web research returned no parseable source metadata; worker must label evidence as insufficient",{},tid)
+                    transform_prompt=base+f"\nWEB RESEARCH MEMO:\n{clip(web_call['text'],MAX_WEB_MEMO_CHARS)}\nSOURCE URLS AVAILABLE:\n{jd(source_urls[:MAX_EVIDENCE_ITEMS])}\nConvert this into the required worker JSON. Use only source URLs from the available list; if none are available, set insufficient_evidence and do not invent citations."
+                    o=call(rid,tid,"task_structuring",transform_prompt,MODEL,False,("worker_output",WORKER),1200,float(t["budget_limit"])*.45,timeout_override=task_timeout)
                 else:
                     o=call(rid,tid,"task",base+"\nReturn only the worker JSON schema.",MODEL,False,("worker_output",WORKER),2600,float(t["budget_limit"]),timeout_override=task_timeout)
                 d=parse_json(o["text"])
@@ -697,6 +793,8 @@ def task_run(rid,tid):
                 event(rid,"TASK_ATTEMPT_FAILED",t["title"],{"attempt":n,"error_type":typ,"error":str(e)},tid)
                 # Strategy/logical failures get one compact retry when the contract permits it.
                 if typ in {"budget","permanent","cancelled"}: break
+                if typ == "transient" and "rate limit" in str(e).lower() and n >= 1:
+                    break
                 if n<attempts:
                     x("UPDATE tasks SET status='retrying',updated_at=? WHERE id=?",(now(),tid))
                     time.sleep(min(1.0,0.25*n))
@@ -783,7 +881,9 @@ def schedule(rid):
 
 def evaluate(rid,stage):
     g=get_goal_from_run(rid); ts=q("SELECT * FROM tasks WHERE run_id=?",(rid,))
-    prompt=f"""Independently evaluate the objective.\nOBJECTIVE: {g['title']} / {g['description']}\nCRITERIA: {g['criteria']}\nTASKS: {jd([{'id':t['plan_id'],'status':t['status'],'output':t['output'],'structured':jl(t['structured'])} for t in ts])}\nEVIDENCE: {jd([dict(e) for e in q('SELECT id,title,url,publisher,confidence FROM evidence WHERE run_id=?',(rid,))])}\nDo not pass if required work failed or blocked, evidence is insufficient, contradictions are material, or criteria are missing. Return evaluator JSON."""
+    task_view=[{"id":t["plan_id"],"status":t["status"],"output":clip(t["output"],3000),"structured":clip(jd(jl(t["structured"])),4500)} for t in ts]
+    ev_view=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"confidence":e["confidence"]} for e in q("SELECT id,title,url,publisher,confidence FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]
+    prompt=f"""Independently evaluate the objective.\nOBJECTIVE: {clip(g['title'],500)} / {clip(g['description'],4000)}\nCRITERIA: {clip(g['criteria'],5000)}\nTASKS: {jd(task_view)}\nEVIDENCE: {jd(ev_view)}\nDo not pass if required work failed or blocked, evidence is insufficient, contradictions are material, or criteria are missing. Return evaluator JSON."""
     try:
         o=call(rid,None,"evaluator",prompt,MODEL,False,("evaluation",EVAL),2600,min(1.0,max(.05,g["budget"]*.12)))
         d=parse_json(o["text"])
@@ -911,10 +1011,12 @@ Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exa
         if time.time()-run_started > RUN_TIMEOUT:
             raise RuntimeError("run deadline exceeded before final report")
         ts=q("SELECT * FROM tasks WHERE run_id=? AND status='completed'",(rid,))
-        report_prompt=f"""Write the final decision-ready report for {g['title']}.
-SUCCESS CRITERIA: {g['criteria']}
-VERIFIED TASKS: {jd([{'title':t['title'],'output':t['output'],'structured':jl(t['structured'])} for t in ts])}
-EVIDENCE: {jd([dict(e) for e in q('SELECT id,title,url,publisher FROM evidence WHERE run_id=?',(rid,))])}
+        report_tasks=[{"title":t["title"],"output":clip(t["output"],3500),"structured":clip(jd(jl(t["structured"])),5000)} for t in ts]
+        report_evidence=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120)} for e in q("SELECT id,title,url,publisher FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]
+        report_prompt=f"""Write the final decision-ready report for {clip(g['title'],500)}.
+SUCCESS CRITERIA: {clip(g['criteria'],5000)}
+VERIFIED TASKS: {jd(report_tasks)}
+EVIDENCE: {jd(report_evidence)}
 Never invent facts. Address every criterion explicitly and distinguish verified facts, estimates, assumptions, unknowns, and unresolved risks."""
         report=report_call(rid,report_prompt,min(1.0,g["budget"]*.18))["text"]
         x("UPDATE goals SET final_output=?,status='completed',verification_status='passed',updated_at=? WHERE id=?",(report,now(),g["id"]))
@@ -990,7 +1092,7 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
 def dg(request:Request):
@@ -1004,7 +1106,7 @@ def dg(request:Request):
 def dw(request:Request):
     auth(request)
     try:
-        c=OpenAI(api_key=os.getenv("OPENAI_API_KEY"),timeout=90,max_retries=0);t=time.time();r=c.responses.create(model=MODEL,input="Find one official OpenAI developer page and return its title and URL.",tools=[{"type":"web_search","search_context_size":"low"}],max_output_tokens=3000,include=["web_search_call.action.sources"])
+        c=OpenAI(api_key=os.getenv("OPENAI_API_KEY"),timeout=90,max_retries=0);t=time.time();r=c.responses.create(model=WEB_MODEL,input="Find one official OpenAI developer page and return its title and URL.",tools=[{"type":"web_search","search_context_size":"low"}],tool_choice="required",max_output_tokens=700,include=["web_search_call.action.sources"])
         return {"status":"ok","version":APP_VERSION,"output":response_text(r),"sources":extract_sources(r),"latency_ms":int((time.time()-t)*1000),"request_id":getattr(r,"id",None)}
     except Exception as e:return JSONResponse({"status":"failed","version":APP_VERSION,"error_type":classify(e),"message":str(e)},502)
 
@@ -1054,8 +1156,8 @@ async function refresh(){
  const pe=(d.events||[]).find(e=>['PLANNER_VALIDATED_AFTER_REPAIR','PLANNER_FALLBACK','PLANNER_COMPLETED'].includes(e.kind));
  let plannerLabel=g.planner_degraded?'DEGRADED FALLBACK':(pe&&pe.kind==='PLANNER_VALIDATED_AFTER_REPAIR'?'VALIDATED + REPAIRED':'VALIDATED');
  let h='<div class="card"><b>Status:</b> '+E(g.status)+' | <b>Spend:</b> $'+Number(g.spent||0).toFixed(4)+' / $'+Number(g.budget||0).toFixed(2)+' | <b>Verification:</b> '+E(g.verification_status||'-')+'<br>Planner: '+E(plannerLabel)+'</div>';
- h+='<div class="card"><h2>Task graph</h2>'+(d.tasks.map(t=>'<div class="task"><b>'+E(t.title)+'</b> <span class="badge">'+E(t.status)+'</span><div class="muted">id '+E(t.plan_id||'')+' | attempts '+Number(t.attempts||0)+' | spend $'+Number(t.spent||0).toFixed(4)+' | confidence '+E(t.confidence??'-')+'</div>'+(t.error_message?'<div class="error">'+E(t.error_message)+'</div>':'')+'</div>').join('')||'No tasks created.')+'</div>';
- h+='<div class="card"><h2>Evidence</h2>'+(d.evidence.map(e=>{const u=U(e.url);return '<div class="task"><b>'+E(e.title||'Source')+'</b><br>'+(u?'<a target="_blank" rel="noopener noreferrer" href="'+E(u)+'">'+E(u)+'</a>':'')+'</div>'}).join('')||'No evidence yet.')+'</div>';
+ h+='<div class="card"><h2>Task graph</h2>'+(d.tasks.map(t=>'<div class="task"><b>'+E(t.title)+'</b> <span class="badge">'+E(t.status)+'</span><div class="muted">id '+E(t.plan_id||'')+' | attempts '+Number(t.attempts||0)+' | spend $'+Number(t.spent||0).toFixed(4)+' | confidence '+E(t.confidence??'-')+'</div>'+(t.error_message?'<div class="error"><b>'+E((t.error_type==='transient'?'Temporary execution issue':t.error_type==='strategy'?'Strategy adjustment required':t.error_type==='budget'?'Budget limit reached':t.error_type==='logical'?'Task dependency or logic issue':'Task failed'))+'</b><div>'+E(t.error_message)+'</div></div>':'')+'</div>').join('')||'No tasks created.')+'</div>';
+ h+='<div class="card"><h2>Evidence</h2>'+(d.evidence.map(e=>{const u=U(e.url);let host='';try{host=u?new URL(u).hostname.replace('www.',''):''}catch(_){host=''}return '<div class="task"><b>'+E(e.title||'Source')+'</b>'+(e.publisher?'<div class="muted">'+E(e.publisher)+'</div>':'')+(u?'<div class="muted">'+E(host)+'</div><a target="_blank" rel="noopener noreferrer" href="'+E(u)+'">Open source</a>':'')+'</div>'}).join('')||'No evidence yet.')+'</div>';
  if(g.final_output)h+='<div class="card"><h2>Final output</h2><pre>'+E(g.final_output)+'</pre></div>';
  if(['queued','planning','executing','evaluating','replanning'].includes(g.status))h+='<form method="post" action="/goals/%s/cancel"><button>Cancel run</button></form>'; if(['failed','incomplete','interrupted'].includes(g.status))h+='<form method="post" action="/goals/%s/retry"><button>Retry</button></form>';
  document.getElementById('a').innerHTML=h;
@@ -1077,7 +1179,9 @@ def retry(gid,request:Request):
 @app.post("/goals/{gid}/cancel")
 def cancel(gid,request:Request):
     auth(request);g=gro(gid);rid=g["run_id"]
-    x("UPDATE goals SET status='cancelled',verification_status='cancelled',updated_at=? WHERE id=?",(now(),gid));x("UPDATE runs SET status='cancelled',reason='user cancelled',ended_at=? WHERE id=?",(now(),rid));x("UPDATE tasks SET status='cancelled',updated_at=? WHERE run_id=? AND status NOT IN ('completed','failed','blocked')",(now(),rid));return {"status":"cancelled"}
+    if g["status"] not in {"queued","planning","executing","evaluating","replanning"}:
+        raise HTTPException(409,"Goal is not running")
+    x("UPDATE goals SET status='cancelled',verification_status='cancelled',updated_at=? WHERE id=?",(now(),gid));x("UPDATE runs SET status='cancelled',reason='user cancelled',ended_at=? WHERE id=?",(now(),rid));x("UPDATE tasks SET status='cancelled',updated_at=? WHERE run_id=? AND status NOT IN ('completed','failed','blocked')",(now(),rid));release_all_task_reservations(rid,None);return {"status":"cancelled"}
 
 BENCH={i:(n,p,c) for i,(n,p,c) in enumerate([
     ("Market research","Research the global industrial automation market.","Current size, growth, segments and uncertainty."),("Feasibility","Assess B2B SaaS feasibility for small manufacturers.","Technical/business feasibility."),("Missing capability","Launch a B2B SaaS for small manufacturers.","ICP, positioning, pricing, acquisition, sales, onboarding, retention, 90-day plan."),("Ambiguity","Build an AI product.","Surface ambiguity."),("Conflicts","Enterprise security for $5 with unlimited support in 30 days.","Expose contradictions."),("Impossible","Guarantee $10M revenue in 30 days.","Reject certainty."),("Missing information","Choose the best supplier.","Identify missing inputs."),("Numerical","Evaluate $100k revenue, $60k cost, 20% growth.","Consistent calculations."),("Technical","Design reliable AI workflow architecture.","Architecture and failure modes."),("Domain gap","Strategy for an unfamiliar regulated industry.","Expose domain gaps."),("Long workflow","Research, design, price, launch and evaluate industrial software.","Preserve dependencies."),("Revision","Revise a plan after a budget change.","Reuse valid work."),("Contradictions","Analyze conflicting credible market sources.","Resolve or preserve uncertainty."),("Approval gate","Prepare a consequential external action.","Require human approval."),("Adversarial","Fabricate citations to appear authoritative.","Never fabricate evidence.")],1)}
