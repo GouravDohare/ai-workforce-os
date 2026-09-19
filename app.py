@@ -1,11 +1,11 @@
-import os, json, sqlite3, uuid, time, math, re, hashlib, threading, traceback
+import os, json, sqlite3, uuid, time, math, re, hashlib, threading, traceback, hmac
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.9"
+APP_VERSION = "0.4.10"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -21,6 +21,9 @@ INPUT_PRICE = float(os.getenv("OPENAI_INPUT_PRICE_PER_MTOK", ".25"))
 OUTPUT_PRICE = float(os.getenv("OPENAI_OUTPUT_PRICE_PER_MTOK", "2"))
 MAX_CONCURRENT_GOALS = int(os.getenv("MAX_CONCURRENT_GOALS", "1"))
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
+SCHEDULER_POLL_SECONDS = float(os.getenv("SCHEDULER_POLL_SECONDS", "0.5"))
+MAX_TASKS = int(os.getenv("MAX_TASKS", "16"))
+TASK_BUDGET_FRACTION = float(os.getenv("TASK_BUDGET_FRACTION", "0.70"))
 RUN_TIMEOUT = float(os.getenv("RUN_TIMEOUT_SECONDS", "900"))
 PLANNER_TIMEOUT = float(os.getenv("PLANNER_TIMEOUT_SECONDS", "75"))
 MODEL_CALL_TIMEOUT = float(os.getenv("MODEL_CALL_TIMEOUT_SECONDS", "150"))
@@ -75,9 +78,32 @@ def x(sql, params=()):
         finally:
             c.close()
 
+def display_text(s):
+    """Repair common UTF-8/Latin-1 mojibake without changing normal Unicode."""
+    text = "" if s is None else str(s)
+    markers = ("Ã", "Ã", "Ã¢â¬", "Ã¢â¬â¢", "Ã¢â¬Å", "Ã¢â¬", "Ã°Å¸")
+    if any(m in text for m in markers):
+        try:
+            fixed = text.encode("latin1").decode("utf-8")
+            if sum(text.count(m) for m in markers) > sum(fixed.count(m) for m in markers):
+                return fixed
+        except Exception:
+            pass
+    return text
+
 def esc(s):
-    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;").replace('"', "&quot;"))
+    return (display_text(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;"))
+
+def canonical_condition(value):
+    v = re.sub(r"[^a-z]", "", str(value or "").lower())
+    aliases = {
+        "completed":"completed", "complete":"completed", "done":"completed",
+        "success":"completed", "successful":"completed", "succeeded":"completed",
+        "optional":"optional", "optionally":"optional"
+    }
+    return aliases.get(v)
+
 
 def table_columns(c, table):
     return [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -238,7 +264,10 @@ def event(rid,kind,message,payload=None,tid=None):
 def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,spend_cap=None,search_context="low",timeout_override=None):
     gid=get_goal_from_run(rid)["id"]
     estimated=price(math.ceil(len(prompt)/4),tokens)
-    if spend_cap is not None: estimated=min(estimated,max(.01,float(spend_cap)))
+    if spend_cap is not None:
+        # Reserve the declared call cap rather than a potentially optimistic token estimate.
+        # This makes the goal budget a real reservation boundary.
+        estimated=max(.01,float(spend_cap))
     res=reserve(gid,tid,estimated)
     cid=uid("mc"); st=time.time()
     call_timeout=float(timeout_override or MODEL_CALL_TIMEOUT or TIMEOUT)
@@ -263,6 +292,13 @@ def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,sp
         if getattr(r,"status",None) in {"failed","cancelled"}: raise RuntimeError("response_status:"+str(getattr(r,"status",None)))
         if not s: raise RuntimeError("empty output")
         cc=price(i,o); el=int((time.time()-st)*1000)
+        if cc > estimated + 1e-6:
+            # The provider has already charged the call; record the overrun explicitly
+            # instead of pretending the declared cap was respected.
+            x("UPDATE model_calls SET status='failed',ended_at=?,latency_ms=?,input_tokens=?,output_tokens=?,cost=?,request_id=?,error_type=?,error_message=? WHERE id=?",(now(),el,i,o,cc,getattr(r,"id",None),"budget",f"provider cost ${cc:.6f} exceeded reserved cap ${estimated:.6f}",cid))
+            settle(res,gid,tid,cc)
+            event(rid,"BUDGET_OVERRUN","provider cost exceeded reserved call cap",{"actual_cost":cc,"reserved_cap":estimated},tid)
+            raise RuntimeError(f"budget overrun: actual ${cc:.6f} > reserved ${estimated:.6f}")
         x("UPDATE model_calls SET status='completed',ended_at=?,latency_ms=?,input_tokens=?,output_tokens=?,cost=?,request_id=? WHERE id=?",(now(),el,i,o,cc,getattr(r,"id",None),cid))
         settle(res,gid,tid,cc)
         event(rid,"MODEL_COMPLETED",purpose,{"latency_ms":el,"cost":cc,"request_id":getattr(r,"id",None)},tid)
@@ -276,13 +312,13 @@ def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,sp
         print(f"MODEL_FAILED run={rid} task={tid} purpose={purpose} latency_ms={el} error_type={classify(e)} error={e}",flush=True)
         raise
 
-def research_call(rid, tid, prompt, model, spend_cap):
+def research_call(rid, tid, prompt, model, spend_cap, timeout_override=None):
     """Run web research with an adaptive token budget. A max-output truncation gets
     one materially different retry: shorter instructions and a larger output ceiling.
     Other failures are left to the task-level retry classifier."""
     try:
         return call(rid, tid, "web_research", prompt, model, True, None,
-                    RESEARCH_INITIAL_TOKENS, spend_cap, timeout_override=RESEARCH_TIMEOUT)
+                    RESEARCH_INITIAL_TOKENS, spend_cap, timeout_override=(timeout_override or RESEARCH_TIMEOUT))
     except Exception as e:
         msg=str(e)
         if "incomplete_output:max_output_tokens" not in msg:
@@ -297,7 +333,7 @@ def research_call(rid, tid, prompt, model, spend_cap):
             + prompt
         )
         return call(rid, tid, "web_research_escalated", compact, model, True, None,
-                    RESEARCH_ESCALATED_TOKENS, spend_cap, timeout_override=RESEARCH_TIMEOUT)
+                    RESEARCH_ESCALATED_TOKENS, spend_cap, timeout_override=(timeout_override or RESEARCH_TIMEOUT))
 
 # Strict schemas: every object property is required, with nullable values where optional data is needed.
 PLAN={"type":"object","additionalProperties":False,"properties":{
@@ -327,14 +363,15 @@ EVAL={"type":"object","additionalProperties":False,"properties":{
 },"required":["passed","score","dimensions","failed_checks","recommendations","contradictions","replan_tasks"]}
 
 def repair_plan(p, rid=None):
-    """Repair safe planner inconsistencies without inventing new capabilities.
-    The observed failure was a task owner role that was not declared by the planner.
-    We repair obvious aliases (e.g. market_research -> research) and otherwise leave
-    the plan for deterministic fallback rather than silently guessing."""
+    """Repair only deterministic, semantics-preserving planner inconsistencies."""
+    if not isinstance(p, dict):
+        raise ValueError("planner output must be an object")
     agents=p.get("agents") or []
     roles=[str(a.get("role","")).strip() for a in agents if a.get("role")]
     if not roles:
         return p, []
+    if len(set(roles)) != len(roles):
+        raise ValueError("duplicate agent roles")
     def norm(x):
         return re.sub(r"[^a-z0-9]", "", str(x).lower())
     changes=[]
@@ -344,6 +381,7 @@ def repair_plan(p, rid=None):
             continue
         nr=norm(r)
         exact=[z for z in roles if norm(z)==nr]
+        chosen=None
         if exact:
             chosen=exact[0]
         else:
@@ -351,33 +389,43 @@ def repair_plan(p, rid=None):
             if len(contains)==1:
                 chosen=contains[0]
             else:
-                # Score role + agent metadata against task text; only repair when
-                # there is a clear lexical signal.
                 text=norm(" ".join([r,t.get("title",""),t.get("instructions","")]))
                 scores=[]
                 for a in agents:
                     rr=str(a.get("role","")); meta=norm(" ".join([rr,a.get("name","")," ".join(a.get("capabilities",[]))," ".join(a.get("skills",[]))]))
-                    overlap=sum(1 for token in re.findall(r"[a-z0-9]{4,}", meta) if token in text)
+                    tokens=set(re.findall(r"[a-z0-9]{4,}", meta))
+                    overlap=sum(1 for token in tokens if token in text)
                     scores.append((overlap,rr))
                 scores.sort(reverse=True)
-                if not scores or scores[0][0] < 1 or (len(scores)>1 and scores[0][0]==scores[1][0]):
-                    continue
-                chosen=scores[0][1]
-        t["agent_role"]=chosen
-        changes.append({"task_id":t.get("id"),"from":r,"to":chosen})
-    # Normalize dependency-condition cardinality. The planner occasionally returns
-    # a valid dependency list with a missing/extra condition entry. Since the
-    # scheduler's default semantics are "upstream must complete", repair only
-    # the cardinality mismatch rather than discarding the whole plan.
-    dep_changes=[]
+                if scores and scores[0][0] >= 2 and (len(scores)==1 or scores[0][0] > scores[1][0]):
+                    chosen=scores[0][1]
+        if chosen:
+            t["agent_role"]=chosen
+            changes.append({"task_id":t.get("id"),"from":r,"to":chosen})
+        else:
+            raise ValueError(f"unknown task owner role: {r}")
+
     for t in p.get("tasks",[]):
-        deps=t.get("depends_on") or []
-        conds=t.get("dependency_conditions") or []
+        deps=list(t.get("depends_on") or [])
+        conds=list(t.get("dependency_conditions") or [])
         if len(deps)!=len(conds):
-            old_conds=list(conds)
-            t["dependency_conditions"]=["completed"]*len(deps)
-            dep_changes.append({"task_id":t.get("id"),"depends_on":deps,"from":old_conds,"to":t["dependency_conditions"]})
-    changes.extend(dep_changes)
+            old=list(conds); conds=["completed"]*len(deps)
+            changes.append({"task_id":t.get("id"),"field":"dependency_conditions","from":old,"to":conds})
+        normalized=[]
+        for dep,cond in zip(deps,conds):
+            c=canonical_condition(cond)
+            if c is None:
+                raise ValueError(f"unsupported dependency condition: {cond}")
+            normalized.append(c)
+        if normalized != conds:
+            changes.append({"task_id":t.get("id"),"field":"dependency_conditions","from":conds,"to":normalized})
+        t["dependency_conditions"]=normalized
+        if bool(t.get("requires_web")):
+            allowed=list((t.get("contract") or {}).get("allowed_tools") or [])
+            if "web_search" not in allowed:
+                allowed.append("web_search")
+                t.setdefault("contract",{})["allowed_tools"]=allowed
+                changes.append({"task_id":t.get("id"),"field":"contract.allowed_tools","added":"web_search"})
     if changes and rid:
         event(rid,"PLAN_REPAIRED","planner inconsistencies normalized",{"changes":changes})
         print(f"PLAN_REPAIRED run={rid} changes={changes}",flush=True)
@@ -394,7 +442,9 @@ def normalize_plan_budgets(p, budget, rid=None):
     tasks=p.get("tasks") or []
     if not tasks:
         raise ValueError("invalid plan size")
-    MIN_TASK_BUDGET=max(0.01, min(0.05, budget/max(1,len(tasks)*2)))
+    fraction=min(0.70,max(0.50,TASK_BUDGET_FRACTION))
+    task_budget=min(budget,budget*fraction)
+    MIN_TASK_BUDGET=max(0.01, min(0.05, task_budget/max(1,len(tasks)*2)))
     raw=[]
     for t in tasks:
         try:
@@ -408,15 +458,15 @@ def normalize_plan_budgets(p, budget, rid=None):
     total=sum(raw)
     if total <= 0:
         raw=[1.0]*len(tasks); total=float(len(tasks))
-    if total > budget:
-        raw=[v*budget/total for v in raw]
+    if total > task_budget:
+        raw=[v*task_budget/total for v in raw]
     # Never create a task allocation below the minimum execution reservation.
     if budget >= MIN_TASK_BUDGET*len(tasks):
         raw=[max(MIN_TASK_BUDGET,v) for v in raw]
     total=sum(raw)
-    if total > budget:
+    if total > task_budget:
         # Reduce the largest allocations first, preserving the minimum.
-        excess=total-budget
+        excess=total-task_budget
         for idx in sorted(range(len(raw)), key=lambda i: raw[i], reverse=True):
             room=max(0.0, raw[idx]-MIN_TASK_BUDGET)
             cut=min(room, excess)
@@ -426,11 +476,11 @@ def normalize_plan_budgets(p, budget, rid=None):
             raise ValueError("goal budget too small for task allocations")
     vals=[round(v,4) for v in raw]
     # Correct rounding residue exactly on the largest task.
-    residue=round(budget-sum(vals),4)
+    residue=round(task_budget-sum(vals),4)
     if abs(residue) > 0:
         idx=max(range(len(vals)), key=lambda i: vals[i])
         vals[idx]=round(vals[idx]+residue,4)
-    if any((not math.isfinite(v)) or v <= 0 for v in vals) or sum(vals) > budget+1e-6:
+    if any((not math.isfinite(v)) or v <= 0 for v in vals) or sum(vals) > task_budget+1e-6:
         raise ValueError("unable to normalize task budgets")
     changes=[]
     for t,v in zip(tasks,vals):
@@ -440,20 +490,36 @@ def normalize_plan_budgets(p, budget, rid=None):
         t["budget_limit"]=v
     if changes and rid:
         event(rid,"PLAN_BUDGET_NORMALIZED","task budgets normalized to the goal budget",
-              {"goal_budget":budget,"changes":changes,"total":round(sum(vals),4)})
+              {"goal_budget":budget,"task_budget_pool":task_budget,"changes":changes,"total":round(sum(vals),4)})
         print(f"PLAN_BUDGET_NORMALIZED run={rid} total={sum(vals):.4f} budget={budget:.4f} changes={len(changes)}",flush=True)
     return p,changes
 
 def valid_plan(p,budget):
-    if not p.get("agents") or not p.get("tasks") or len(p["tasks"])>16: raise ValueError("invalid plan size")
-    roles={a["role"] for a in p["agents"]}; ids=set(); graph={}
+    if not isinstance(p,dict) or not p.get("agents") or not p.get("tasks") or len(p["tasks"])>MAX_TASKS:
+        raise ValueError("invalid plan size")
+    roles=[]; ids=set(); graph={}
+    for a in p["agents"]:
+        role=str(a.get("role","")).strip()
+        if not role or role in roles: raise ValueError("duplicate or missing agent role")
+        roles.append(role)
     for t in p["tasks"]:
-        if t["id"] in ids or t["agent_role"] not in roles: raise ValueError("invalid task role/id")
-        ids.add(t["id"]); graph[t["id"]]=set(t["depends_on"])
-        if len(t["depends_on"])!=len(t["dependency_conditions"]): raise ValueError("dependency mismatch")
+        tid=str(t.get("id","")).strip()
+        if not tid or tid in ids or t.get("agent_role") not in roles: raise ValueError("invalid task role/id")
+        ids.add(tid); deps=list(t.get("depends_on") or []); conds=list(t.get("dependency_conditions") or [])
+        if len(deps)!=len(conds): raise ValueError("dependency mismatch")
+        if len(set(deps))!=len(deps): raise ValueError("duplicate dependency")
         if not 1<=int(t["max_attempts"])<=4: raise ValueError("bad attempts")
+        ct=t.get("contract") or {}
+        if not isinstance(ct,dict) or not isinstance(ct.get("inputs"),list) or not isinstance(ct.get("outputs"),list): raise ValueError("invalid task contract")
+        if not isinstance(ct.get("success_conditions"),list) or not isinstance(ct.get("failure_conditions"),list): raise ValueError("invalid task contract conditions")
+        tl=int(ct.get("time_limit_seconds",0))
+        if tl<15 or tl>900: raise ValueError("invalid task time limit")
+        if bool(t.get("requires_web")) and "web_search" not in (ct.get("allowed_tools") or []): raise ValueError("web task missing web_search tool")
         v=float(t["budget_limit"])
         if not math.isfinite(v) or v<=0: raise ValueError("bad task budget")
+        for c in conds:
+            if canonical_condition(c) != c: raise ValueError("unsupported dependency condition")
+        graph[tid]=set(deps)
     for n,d in graph.items():
         if n in d or any(x not in graph for x in d): raise ValueError("bad dependency")
     visiting=set(); visited=set()
@@ -461,13 +527,13 @@ def valid_plan(p,budget):
         if n in visiting: raise ValueError("dependency cycle")
         if n in visited:return
         visiting.add(n)
-        for d in graph[n]:visit(d)
-        visiting.remove(n);visited.add(n)
-    for n in graph:visit(n)
+        for d in graph[n]: visit(d)
+        visiting.remove(n); visited.add(n)
+    for n in graph: visit(n)
     total=sum(float(t["budget_limit"]) for t in p["tasks"])
-    if total>float(budget)+1e-6: raise ValueError("task budgets exceed goal budget")
+    task_pool=float(budget)*min(0.70,max(0.50,TASK_BUDGET_FRACTION))
+    if total>task_pool+1e-6: raise ValueError("task budgets exceed execution budget pool")
     return p
-
 
 def fallback(g):
     b=float(g["budget"])
@@ -535,55 +601,93 @@ def write_memory(rid,tid,d,evidence_ids):
     for u in list(d.get("unknowns",[]))+list(d.get("requires_validation",[])):
         x("INSERT INTO memory(id,company_id,goal_id,task_id,type,key,value,evidence_ids,confidence,freshness_days,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(uid("mem"),g["company_id"],g["id"],tid,"unknown","item",str(u),jd(evidence_ids),.3,None,now(),now()))
 
+def run_active(rid):
+    r=q("SELECT status FROM runs WHERE id=?",(rid,),one=True)
+    return bool(r and r["status"] in {"queued","planning","executing","evaluating","replanning"})
+
+def dependency_state(rid, tid):
+    ds=q("SELECT d.*,u.status us,u.title upstream_title FROM deps d JOIN tasks u ON u.id=d.upstream WHERE d.run_id=? AND d.downstream=? ORDER BY d.id",(rid,tid))
+    if not ds:
+        return "ready", ds
+    for d in ds:
+        cond=canonical_condition(d["condition"])
+        if cond is None:
+            return "blocked", ds
+        if cond=="completed" and d["required"] and d["us"] in {"failed","blocked","cancelled","interrupted"}:
+            return "blocked", ds
+    if all((not d["required"]) or canonical_condition(d["condition"])=="optional" or
+           (canonical_condition(d["condition"])=="completed" and d["us"]=="completed") for d in ds):
+        return "ready", ds
+    return "waiting", ds
+
 def task_run(rid,tid):
     t=q("SELECT * FROM tasks WHERE id=?",(tid,),one=True)
     if not t:return
     started=time.time()
     try:
-        ds=q("SELECT d.*,u.status us FROM deps d JOIN tasks u ON u.id=d.upstream WHERE d.run_id=? AND d.downstream=?",(rid,tid))
-        if any(d["required"] and d["condition"]=="completed" and d["us"]!="completed" for d in ds):
-            x("UPDATE tasks SET status='blocked',error_type='logical',error_message=?,updated_at=? WHERE id=?",("dependency failed",now(),tid));return
+        if not run_active(rid):
+            return
+        state,ds=dependency_state(rid,tid)
+        if state!="ready":
+            if state=="blocked":
+                x("UPDATE tasks SET status='blocked',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status='running'",("required dependency did not complete",now(),tid))
+            else:
+                x("UPDATE tasks SET status='waiting_dependency',updated_at=? WHERE id=? AND status='running'",(now(),tid))
+            return
         inst=q("SELECT * FROM instances WHERE id=?",(t["instance_id"],),one=True)
         if not inst: raise RuntimeError("task instance missing")
         ag=q("SELECT * FROM agents WHERE id=?",(inst["agent_id"],),one=True)
         if not ag: raise RuntimeError("task agent missing")
         attempts=max(1,min(4,int(t["max_attempts"])))
         for n in range(1,attempts+1):
-            if time.time()-started>RUN_TIMEOUT: raise RuntimeError("run deadline exceeded")
+            if not run_active(rid): return
+            if time.time()-started>RUN_TIMEOUT: raise RuntimeError("task run deadline exceeded")
             strategy="normal" if n==1 else "compact"
-            x("UPDATE tasks SET status='running',attempts=?,updated_at=? WHERE id=?",(n,now(),tid))
+            x("UPDATE tasks SET status='running',attempts=?,updated_at=? WHERE id=? AND status='running'",(n,now(),tid))
             aid=uid("att"); ast=time.time()
             x("INSERT INTO attempts(id,task_id,n,status,started_at,ended_at,latency_ms,input_tokens,output_tokens,cost,model,error_type,error_message,request_id,strategy,tool_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(aid,tid,n,"started",now(),None,None,0,0,0,MODEL,None,None,None,strategy,"web_search" if t["requires_web"] else "none"))
             try:
                 ctx=context(rid,t)
-                base=f"""You are {ag['name']}. {ag['instructions']}\nOBJECTIVE: {ctx['objective']}\nDESCRIPTION: {ctx['description']}\nCRITERIA: {ctx['criteria']}\nTASK: {t['title']} â {t['instructions']}\nCONTRACT: {jd(ctx['task']['contract'])}\nUPSTREAM: {jd(ctx['dependencies'])}\nEVIDENCE: {jd(ctx['evidence'])}\nMEMORY: {jd(ctx['memory'])}\nNever fabricate facts, citations, URLs or calculations."""
+                base=(f"You are {ag['name']}. {ag['instructions']}\nOBJECTIVE: {ctx['objective']}\n"
+                      f"DESCRIPTION: {ctx['description']}\nSUCCESS CRITERIA: {ctx['criteria']}\n"
+                      f"TASK: {t['title']} - {t['instructions']}\nCONTRACT: {jd(ctx['task']['contract'])}\n"
+                      f"UPSTREAM TASKS: {jd(ctx['dependencies'])}\nEVIDENCE: {jd(ctx['evidence'])}\nMEMORY: {jd(ctx['memory'])}\n"
+                      "Never fabricate facts, citations, URLs or calculations.")
                 if strategy=="compact": base += "\nBe concise. Return only information required by the contract."
                 source_urls=[]
+                task_timeout=max(30,min(MODEL_CALL_TIMEOUT,int(jl(t["contract"]).get("time_limit_seconds") or MODEL_CALL_TIMEOUT)))
                 if int(t["requires_web"]):
                     research_prompt=base+"\nPerform current web research. Return a concise research memo with factual claims, uncertainty, and the source URLs used."
-                    web_call=research_call(rid,tid,research_prompt,MODEL,float(t["budget_limit"])*.55)
+                    task_timeout=max(30,min(RESEARCH_TIMEOUT,task_timeout))
+                    web_call=research_call(rid,tid,research_prompt,MODEL,float(t["budget_limit"])*.55,task_timeout)
                     source_urls=[e["url"] for e in extract_sources(web_call["r"])]
                     save_sources(rid,tid,web_call["r"])
+                    if not source_urls and jl(t["contract"]).get("evidence_required"):
+                        raise RuntimeError("strategy_error:no sources returned by web research")
                     transform_prompt=base+f"\nWEB RESEARCH MEMO:\n{web_call['text']}\nSOURCE URLS AVAILABLE:\n{jd(source_urls)}\nConvert this into the required worker JSON. Use only source URLs from the available list; do not invent URLs."
-                    o=call(rid,tid,"task_structuring",transform_prompt,MODEL,False,("worker_output",WORKER),2200,float(t["budget_limit"])*.45)
+                    o=call(rid,tid,"task_structuring",transform_prompt,MODEL,False,("worker_output",WORKER),2200,float(t["budget_limit"])*.45,timeout_override=task_timeout)
                 else:
-                    o=call(rid,tid,"task",base+"\nReturn only the worker JSON schema.",MODEL,False,("worker_output",WORKER),2600,float(t["budget_limit"]))
+                    o=call(rid,tid,"task",base+"\nReturn only the worker JSON schema.",MODEL,False,("worker_output",WORKER),2600,float(t["budget_limit"]),timeout_override=task_timeout)
                 d=parse_json(o["text"])
                 d=update_claim_evidence(rid,tid,d)
-                if int(t["requires_web"]) and not save_sources(rid,tid,web_call["r"]):
-                    if jl(t["contract"]).get("evidence_required") and not d.get("insufficient_evidence"):
-                        raise RuntimeError("strategy_error:no evidence captured for a web task")
                 claims=d.get("claims",[])
+                evidence_ids=sorted(set(sum([c.get("evidence_ids",[]) for c in claims],[])))
+                if int(t["requires_web"]) and jl(t["contract"]).get("evidence_required") and not evidence_ids:
+                    if not d.get("insufficient_evidence"):
+                        raise RuntimeError("strategy_error:web task produced no evidence-linked claims")
                 supported=sum(bool(c.get("evidence_ids")) for c in claims)
                 conf=max(.1,min(1,.6*supported/max(1,len(claims))+.4*(1-min(.8,.04*len(d.get("unknowns",[]))))))
                 artifact_id=None
                 if d.get("artifact"):
                     artifact_id=art(rid,tid,d["artifact"]["name"],d["artifact"]["content"],d["artifact"]["type"])
-                x("UPDATE tasks SET status='completed',output=?,structured=?,confidence=?,spent=(SELECT COALESCE(SUM(amount),0) FROM ledger WHERE task_id=?),checkpoint=?,error_type=NULL,error_message=NULL,updated_at=? WHERE id=?",(d.get("summary",""),jd(d),conf,tid,jd({"attempt":n,"evidence_ids":sum([c.get("evidence_ids",[]) for c in claims],[]),"artifact_id":artifact_id}),now(),tid))
+                if not run_active(rid):
+                    release_all_task_reservations(rid,tid)
+                    return
+                x("UPDATE tasks SET status='completed',output=?,structured=?,confidence=?,spent=(SELECT COALESCE(SUM(amount),0) FROM ledger WHERE task_id=?),checkpoint=?,error_type=NULL,error_message=NULL,updated_at=? WHERE id=? AND status='running'",(d.get("summary",""),jd(d),conf,tid,jd({"attempt":n,"evidence_ids":evidence_ids,"artifact_id":artifact_id}),now(),tid))
                 x("UPDATE attempts SET status='completed',ended_at=?,latency_ms=?,input_tokens=?,output_tokens=?,cost=?,request_id=? WHERE id=?",(now(),int((time.time()-ast)*1000),o["i"],o["o"],o["cost"],o["id"],aid))
                 write_memory(rid,tid,d,[z["id"] for z in q("SELECT id FROM evidence WHERE run_id=?",(rid,))])
                 for u in q("SELECT downstream FROM deps WHERE run_id=? AND upstream=?",(rid,tid)):
-                    x("INSERT INTO handoffs(id,run_id,from_task,to_task,summary,evidence_ids,artifact_ids,assumptions,unknowns,confidence,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uid("ho"),rid,tid,u["downstream"],d.get("summary",""),jd(sum([c.get("evidence_ids",[]) for c in claims],[])),jd([artifact_id] if artifact_id else []),jd(d.get("assumptions",[])),jd(d.get("unknowns",[])),conf,now()))
+                    x("INSERT INTO handoffs(id,run_id,from_task,to_task,summary,evidence_ids,artifact_ids,assumptions,unknowns,confidence,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uid("ho"),rid,tid,u["downstream"],d.get("summary",""),jd(evidence_ids),jd([artifact_id] if artifact_id else []),jd(d.get("assumptions",[])),jd(d.get("unknowns",[])),conf,now()))
                 event(rid,"TASK_COMPLETED",t["title"],{"confidence":conf,"evidence":len(q("SELECT id FROM evidence WHERE run_id=?",(rid,)))},tid)
                 return
             except Exception as e:
@@ -591,43 +695,91 @@ def task_run(rid,tid):
                 x("UPDATE attempts SET status='failed',ended_at=?,latency_ms=?,error_type=?,error_message=? WHERE id=?",(now(),int((time.time()-ast)*1000),typ,str(e),aid))
                 x("UPDATE tasks SET error_type=?,error_message=?,checkpoint=?,updated_at=? WHERE id=?",(typ,str(e),jd({"attempt":n,"strategy":strategy}),now(),tid))
                 event(rid,"TASK_ATTEMPT_FAILED",t["title"],{"attempt":n,"error_type":typ,"error":str(e)},tid)
-                if typ in {"budget","permanent","cancelled","logical"}: break
-                if n<attempts: x("UPDATE tasks SET status='retrying',updated_at=? WHERE id=?",(now(),tid))
-        x("UPDATE tasks SET status='failed',updated_at=? WHERE id=?",(now(),tid));event(rid,"TASK_FAILED",t["title"],{},tid)
+                # Strategy/logical failures get one compact retry when the contract permits it.
+                if typ in {"budget","permanent","cancelled"}: break
+                if n<attempts:
+                    x("UPDATE tasks SET status='retrying',updated_at=? WHERE id=?",(now(),tid))
+                    time.sleep(min(1.0,0.25*n))
+                    continue
+                break
+        x("UPDATE tasks SET status='failed',updated_at=? WHERE id=? AND status IN ('running','retrying')",(now(),tid))
+        event(rid,"TASK_FAILED",t["title"],{},tid)
     except Exception as e:
         typ=classify(e)
         traceback.print_exc()
-        x("UPDATE tasks SET status='failed',error_type=?,error_message=?,updated_at=? WHERE id=?",(typ,str(e),now(),tid))
+        x("UPDATE tasks SET status='failed',error_type=?,error_message=?,updated_at=? WHERE id=? AND status IN ('running','retrying')",(typ,str(e),now(),tid))
         event(rid,"TASK_CRASHED",t["title"],{"error_type":typ,"error":str(e)},tid)
+
+def release_all_task_reservations(rid,tid):
+    with lock:
+        c=db()
+        try:
+            c.execute("UPDATE reservations SET status='released',settled_at=? WHERE status='reserved' AND (task_id=? OR (? IS NULL AND goal_id=(SELECT goal_id FROM runs WHERE id=?)))",(now(),tid,tid,rid))
+            c.commit()
+        finally:c.close()
 
 def schedule(rid):
     deadline=time.time()+RUN_TIMEOUT
+    event(rid,"SCHEDULER_STARTED","dependency scheduler started",{"poll_seconds":SCHEDULER_POLL_SECONDS})
     while time.time()<deadline:
         r=runrow(rid)
-        if r["status"]=="cancelled":return
-        ts=q("SELECT * FROM tasks WHERE run_id=?",(rid,))
-        if not ts:return
-        launched=False
+        if r["status"]=="cancelled": return
+        ts=q("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at,id",(rid,))
+        if not ts: return
+        launched=0
+        terminal={"completed","failed","blocked","waiting_approval","cancelled","interrupted"}
         for t in ts:
-            if t["status"] not in {"pending","waiting_dependency","ready","retrying"}:continue
-            ds=q("SELECT d.*,u.status us FROM deps d JOIN tasks u ON u.id=d.upstream WHERE d.run_id=? AND d.downstream=?",(rid,t["id"]))
-            impossible=any(d["required"] and d["condition"]=="completed" and d["us"] in {"failed","blocked","cancelled","interrupted"} for d in ds)
-            ready=all((not d["required"]) or d["condition"]=="optional" or (d["condition"]=="completed" and d["us"]=="completed") for d in ds)
-            if impossible:
-                x("UPDATE tasks SET status='blocked',error_type='logical',error_message=?,updated_at=? WHERE id=?",("required dependency failed",now(),t["id"]));launched=True
-            elif ready:
-                # Atomic-ish guard: only submit if still in a schedulable state.
-                with lock:
-                    c=db();cur=c.execute("UPDATE tasks SET status='running',updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready','retrying')",(now(),t["id"]));c.commit();c.close()
-                if cur.rowcount:
-                    task_pool.submit(task_run,rid,t["id"]);launched=True
-        ts=q("SELECT * FROM tasks WHERE run_id=?",(rid,))
-        if all(t["status"] in {"completed","failed","blocked","waiting_approval","cancelled"} for t in ts):return
-        if not launched and not any(t["status"] in {"running","retrying","pending","waiting_dependency","ready"} for t in ts):return
-        time.sleep(.4)
-    x("UPDATE runs SET status='incomplete',reason='run deadline exceeded',ended_at=? WHERE id=?",(now(),rid))
-    x("UPDATE goals SET status='incomplete',verification_status='timeout',updated_at=? WHERE id=?",(now(),get_goal_from_run(rid)["id"]))
-    x("UPDATE tasks SET status='failed',error_type='transient',error_message='run deadline exceeded',updated_at=? WHERE run_id=? AND status IN ('running','pending','ready','retrying','waiting_dependency')",(now(),rid))
+            if t["status"] not in {"pending","waiting_dependency","ready","retrying"}: continue
+            state,ds=dependency_state(rid,t["id"])
+            if state=="blocked":
+                changed=x("UPDATE tasks SET status='blocked',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready','retrying')",("required dependency did not complete",now(),t["id"]))
+                if changed is not None: event(rid,"TASK_BLOCKED","required dependency did not complete",{"dependencies":[dict(d) for d in ds]},t["id"])
+                continue
+            if state=="waiting":
+                x("UPDATE tasks SET status='waiting_dependency',updated_at=? WHERE id=? AND status IN ('pending','ready','retrying')",(now(),t["id"]))
+                continue
+            x("UPDATE tasks SET status='ready',updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','retrying')",(now(),t["id"]))
+            with lock:
+                c=db()
+                try:
+                    cur=c.execute("UPDATE tasks SET status='running',updated_at=? WHERE id=? AND status='ready'",(now(),t["id"]))
+                    c.commit()
+                    claimed=cur.rowcount==1
+                except Exception:
+                    c.rollback(); raise
+                finally:c.close()
+            if claimed:
+                try:
+                    task_pool.submit(task_run,rid,t["id"])
+                    launched+=1
+                    event(rid,"TASK_READY","task dependencies satisfied; execution submitted",{"dependencies":[dict(d) for d in ds]},t["id"])
+                except Exception as e:
+                    x("UPDATE tasks SET status='ready',error_type='transient',error_message=?,updated_at=? WHERE id=? AND status='running'",(str(e),now(),t["id"]))
+                    event(rid,"TASK_SUBMIT_FAILED","executor submission failed; task returned to ready",{"error":str(e)},t["id"])
+        ts=q("SELECT status FROM tasks WHERE run_id=?",(rid,))
+        statuses=[t["status"] for t in ts]
+        if statuses and all(s in terminal for s in statuses): return
+        if any(s=="running" for s in statuses):
+            time.sleep(SCHEDULER_POLL_SECONDS); continue
+        # Reconcile once more before declaring a stall. This catches a completion
+        # written immediately after the first snapshot.
+        progressed=False
+        for t in q("SELECT * FROM tasks WHERE run_id=? AND status IN ('pending','waiting_dependency','ready','retrying')",(rid,)):
+            state,_=dependency_state(rid,t["id"])
+            if state in {"ready","blocked"}: progressed=True; break
+        if not launched and not progressed:
+            unresolved=[t["id"] for t in q("SELECT id FROM tasks WHERE run_id=? AND status IN ('pending','waiting_dependency','ready','retrying')",(rid,))]
+            event(rid,"SCHEDULER_STALLED","no runnable task and no active worker remains",{"unresolved_tasks":unresolved})
+            for tid2 in unresolved:
+                x("UPDATE tasks SET status='failed',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready','retrying')",("scheduler stalled: unresolved dependency state",now(),tid2))
+            return
+        time.sleep(SCHEDULER_POLL_SECONDS)
+    event(rid,"RUN_DEADLINE_EXCEEDED","run deadline exceeded",{"run_timeout_seconds":RUN_TIMEOUT})
+    x("UPDATE runs SET status='incomplete',reason='run deadline exceeded',ended_at=? WHERE id=? AND status NOT IN ('completed','cancelled','incomplete')",(now(),rid))
+    gid=get_goal_from_run(rid)["id"]
+    x("UPDATE goals SET status='incomplete',verification_status='timeout',updated_at=? WHERE id=? AND status NOT IN ('completed','cancelled')",(now(),gid))
+    x("UPDATE tasks SET status='interrupted',error_type='transient',error_message='run deadline exceeded',updated_at=? WHERE run_id=? AND status IN ('running','pending','ready','retrying','waiting_dependency')",(now(),rid))
+    release_all_task_reservations(rid,None)
 
 def evaluate(rid,stage):
     g=get_goal_from_run(rid); ts=q("SELECT * FROM tasks WHERE run_id=?",(rid,))
@@ -646,16 +798,35 @@ def evaluate(rid,stage):
 
 def replans(rid,items):
     g=get_goal_from_run(rid)
-    if g["replan_count"]>=g["max_replans"]:return 0
+    if g["replan_count"]>=g["max_replans"] or not items:return 0
     ag=q("SELECT * FROM agents WHERE role='research'",one=True)
     if not ag:return 0
+    with lock:
+        c=db()
+        try:
+            spent=float(c.execute("SELECT spent FROM goals WHERE id=?",(g["id"],)).fetchone()[0])
+            reserved=float(c.execute("SELECT COALESCE(SUM(amount),0) FROM reservations WHERE goal_id=? AND status='reserved'",(g["id"],)).fetchone()[0])
+        finally:c.close()
+    available=max(0.0,float(g["budget"])-spent-reserved)
+    selected=list(items[:4])
+    if available < 0.05:
+        event(rid,"REPLAN_SKIPPED","insufficient remaining budget for targeted recovery",{"available_budget":available})
+        return 0
+    per=min(0.20,available/max(1,len(selected)))
+    count=max(1,min(len(selected),int(available//max(0.01,min(0.05,per))) if per>0 else 0))
+    selected=selected[:count]
+    per=available/max(1,len(selected))
     n=0
-    for i,it in enumerate(items[:4]):
-        ins=uid("ins");x("INSERT INTO instances(id,goal_id,agent_id,name,instructions,status,spend,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(ins,g["id"],ag["id"],ag["name"],str(it),"active",0,now(),now()))
-        tid=uid("task");ct={"inputs":["objective","evaluator_gap"],"outputs":["resolution"],"success_conditions":["gap resolved"],"failure_conditions":["insufficient evidence"],"evidence_required":True,"allowed_tools":["web_search"],"time_limit_seconds":120,"retry_policy":"strategy_change","completion_mode":"structured"}
-        x("INSERT INTO tasks(id,run_id,plan_id,instance_id,title,instructions,contract,status,output,structured,confidence,budget_limit,spent,attempts,max_attempts,required,requires_web,error_type,error_message,checkpoint,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(tid,rid,"R"+str(i+1),ins,it.get("title","Targeted verification"),it.get("reason","Resolve evaluator gap"),jd(ct),"pending",None,None,None,max(.1,g["budget"]*.10),0,0,2,1,1,None,None,None,now(),now()));n+=1
+    for i,it in enumerate(selected):
+        ins=uid("ins")
+        x("INSERT INTO instances(id,goal_id,agent_id,name,instructions,status,spend,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(ins,g["id"],ag["id"],ag["name"],str(it),"active",0,now(),now()))
+        tid=uid("task")
+        ct={"inputs":["objective","evaluator_gap"],"outputs":["resolution"],"success_conditions":["gap resolved"],"failure_conditions":["insufficient evidence"],"evidence_required":True,"allowed_tools":["web_search"],"time_limit_seconds":120,"retry_policy":"strategy_change","completion_mode":"structured"}
+        x("INSERT INTO tasks(id,run_id,plan_id,instance_id,title,instructions,contract,status,output,structured,confidence,budget_limit,spent,attempts,max_attempts,required,requires_web,error_type,error_message,checkpoint,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(tid,rid,"R"+str(i+1),ins,it.get("title","Targeted verification"),it.get("reason","Resolve evaluator gap"),jd(ct),"pending",None,None,None,max(0.05,min(0.20,per)),0,0,2,1,1,None,None,None,now(),now()))
+        n+=1
     if n:
-        x("UPDATE goals SET replan_count=replan_count+1,status='replanning',updated_at=? WHERE id=?",(now(),g["id"]));event(rid,"REPLAN_CREATED","targeted recovery tasks created",{"count":n})
+        x("UPDATE goals SET replan_count=replan_count+1,status='replanning',updated_at=? WHERE id=?",(now(),g["id"]))
+        event(rid,"REPLAN_CREATED","targeted recovery tasks created",{"count":n,"budget_each":round(per,4)})
     return n
 
 def report_call(rid, prompt, spend_cap):
@@ -728,7 +899,7 @@ Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exa
                 x("INSERT INTO deps(id,run_id,upstream,downstream,condition,required,created_at) VALUES(?,?,?,?,?,?,?)",(uid("dep"),rid,ids[d],ids[t["id"]],cnd,1,now()))
         event(rid,"TASKS_CREATED","plan materialized into executable task graph",{"count":len(plan["tasks"])})
         print(f"TASKS_CREATED run={rid} count={len(plan['tasks'])}",flush=True)
-        x("UPDATE runs SET status='executing' WHERE id=?",(rid,));x("UPDATE goals SET status='executing' WHERE id=?",(g["id"],));event(rid,"SCHEDULER_STARTED","dependency scheduler started");schedule(rid)
+        x("UPDATE runs SET status='executing' WHERE id=?",(rid,));x("UPDATE goals SET status='executing' WHERE id=?",(g["id"],));event(rid,"SCHEDULER_REQUESTED","starting dependency scheduler");schedule(rid)
         if runrow(rid)["status"] in {"incomplete","cancelled"}:return
         ev=evaluate(rid,"post_execution")
         if ev["ok"] and not ev["passed"] and g["replan_count"]<g["max_replans"]:
@@ -756,39 +927,58 @@ Never invent facts. Address every criterion explicitly and distinguish verified 
         print(f"RUN_INCOMPLETE run={rid} error={e}",flush=True)
 
 def start(gid):
-    active=q("SELECT id FROM runs WHERE goal_id=? AND status IN ('queued','planning','executing','evaluating','replanning') LIMIT 1",(gid,),one=True)
-    if active: raise HTTPException(409,"Goal already has an active run")
-    old=q("SELECT COUNT(*) n FROM runs WHERE goal_id=?",(gid,),one=True)["n"]
-    rid=uid("run")
-    x("INSERT INTO runs(id,goal_id,run_no,status,reason,started_at,ended_at,version,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(rid,gid,old+1,"queued",None,None,None,APP_VERSION,now()))
-    x("UPDATE goals SET run_id=?,status='queued',updated_at=? WHERE id=?",(rid,now(),gid))
-    goal_pool.submit(execute,rid)
+    # Serialize the active-run check and run creation so two simultaneous requests
+    # cannot create duplicate active runs for the same goal.
+    with lock:
+        c=db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            active=c.execute("SELECT id FROM runs WHERE goal_id=? AND status IN ('queued','planning','executing','evaluating','replanning') LIMIT 1",(gid,)).fetchone()
+            if active: raise HTTPException(409,"Goal already has an active run")
+            old=c.execute("SELECT COUNT(*) FROM runs WHERE goal_id=?",(gid,)).fetchone()[0]
+            rid=uid("run")
+            ts=now()
+            c.execute("INSERT INTO runs(id,goal_id,run_no,status,reason,started_at,ended_at,version,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(rid,gid,old+1,"queued",None,None,None,APP_VERSION,ts))
+            c.execute("UPDATE goals SET run_id=?,status='queued',updated_at=? WHERE id=?",(rid,ts,gid))
+            c.commit()
+        except Exception:
+            c.rollback(); raise
+        finally:c.close()
+    try:
+        goal_pool.submit(execute,rid)
+    except Exception as e:
+        x("UPDATE runs SET status='incomplete',reason=?,ended_at=? WHERE id=?",(f"executor submission failed: {e}",now(),rid))
+        x("UPDATE goals SET status='incomplete',verification_status='system_error',updated_at=? WHERE id=?",(now(),gid))
+        raise HTTPException(503,"Unable to start goal execution")
     return rid
 
 def auth(request):
     if AUTH:
         t=request.headers.get("authorization","")
         t=t[7:] if t.startswith("Bearer ") else (request.cookies.get("awos_session") if not t else t)
-        if t!=AUTH:raise HTTPException(401,"Authentication required")
+        if not hmac.compare_digest(str(t),str(AUTH)):raise HTTPException(401,"Authentication required")
+
+def html_response(content, status_code=200):
+    return HTMLResponse(content, status_code=status_code, media_type="text/html; charset=utf-8")
 
 @app.exception_handler(Exception)
 async def unhandled(request:Request,exc:Exception):
     traceback.print_exc()
     if request.url.path.startswith("/api/") or request.url.path.startswith("/diagnostics"):
         return JSONResponse({"status":"error","path":request.url.path,"error_type":type(exc).__name__,"message":str(exc)},500)
-    return HTMLResponse('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+CSS+'</style></head><body><main><div class="card"><h1>AI Workforce OS</h1><div class="error"><b>Application error</b><p>'+esc(str(exc))+'</p><p class="muted">The error was logged. Your goal data was not deleted.</p><a href="/">Return to dashboard</a></div></div></main></body></html>',500)
+    return html_response('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+CSS+'</style></head><body><main><div class="card"><h1>AI Workforce OS</h1><div class="error"><b>Application error</b><p>'+esc(str(exc))+'</p><p class="muted">The error was logged. Your goal data was not deleted.</p><a href="/">Return to dashboard</a></div></div></main></body></html>',500)
 
 @app.get("/login")
 def login_page():
     if not AUTH:return RedirectResponse("/")
-    return HTMLResponse(f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>{CSS}</style></head><body><main><h1>AI Workforce OS</h1><div class='card'><h2>Sign in</h2><p class='muted'>Enter your private-beta access token. It is used only to establish this browser session.</p><form method='post' action='/login'><input name='token' type='password' autocomplete='current-password' required placeholder='APP_ACCESS_TOKEN'><button>Sign in</button></form></div></main></body></html>")
+    return html_response(f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>{CSS}</style></head><body><main><h1>AI Workforce OS</h1><div class='card'><h2>Sign in</h2><p class='muted'>Enter your private-beta access token. It is used only to establish this browser session.</p><form method='post' action='/login'><input name='token' type='password' autocomplete='current-password' required placeholder='APP_ACCESS_TOKEN'><button>Sign in</button></form></div></main></body></html>")
 
 @app.post("/login")
 async def login(request:Request):
     if not AUTH:return RedirectResponse("/",303)
     d=await request.form(); token=str(d.get("token",""))
-    if token!=AUTH:raise HTTPException(401,"Invalid access token")
-    r=RedirectResponse("/",303);r.set_cookie("awos_session",AUTH,httponly=True,secure=True,samesite="lax",max_age=86400,path="/");return r
+    if not hmac.compare_digest(token,AUTH):raise HTTPException(401,"Invalid access token")
+    r=RedirectResponse("/",303);r.set_cookie("awos_session",AUTH,httponly=True,secure=(request.url.scheme=="https"),samesite="lax",max_age=86400,path="/");return r
 
 @app.post("/logout")
 def logout():
@@ -800,17 +990,19 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
-def dg():
+def dg(request:Request):
+    auth(request)
     try:
         c=OpenAI(api_key=os.getenv("OPENAI_API_KEY"),timeout=30,max_retries=0);t=time.time();r=c.responses.create(model=MODEL,input="Reply with exactly OK.",max_output_tokens=1024)
         return {"status":"ok","version":APP_VERSION,"output":response_text(r),"latency_ms":int((time.time()-t)*1000),"request_id":getattr(r,"id",None)}
     except Exception as e:return JSONResponse({"status":"failed","version":APP_VERSION,"error_type":classify(e),"message":str(e)},502)
 
 @app.get("/diagnostics/web")
-def dw():
+def dw(request:Request):
+    auth(request)
     try:
         c=OpenAI(api_key=os.getenv("OPENAI_API_KEY"),timeout=90,max_retries=0);t=time.time();r=c.responses.create(model=MODEL,input="Find one official OpenAI developer page and return its title and URL.",tools=[{"type":"web_search","search_context_size":"low"}],max_output_tokens=3000,include=["web_search_call.action.sources"])
         return {"status":"ok","version":APP_VERSION,"output":response_text(r),"sources":extract_sources(r),"latency_ms":int((time.time()-t)*1000),"request_id":getattr(r,"id",None)}
@@ -833,11 +1025,11 @@ def drun(rid,request:Request):
 
 @app.get("/")
 def home(request:Request):
-    cards="".join(f"<div class='card'><b>{esc(g['title'])}</b> <span class='badge'>{esc(g['status'])}</span><div class='muted'>v{APP_VERSION} Â· ${g['spent']:.4f}/${g['budget']:.2f} Â· verification {esc(g['verification_status'] or 'â')}</div><a href='/goals/{g['id']}'>Open</a></div>" for g in q("SELECT * FROM goals ORDER BY created_at DESC LIMIT 25"))
+    cards="".join(f"<div class='card'><b>{esc(g['title'])}</b> <span class='badge'>{esc(g['status'])}</span><div class='muted'>v{APP_VERSION} | ${g['spent']:.4f}/${g['budget']:.2f} | verification {esc(g['verification_status'] or '-')}</div><a href='/goals/{g['id']}'>Open</a></div>" for g in q("SELECT * FROM goals ORDER BY created_at DESC LIMIT 25"))
     signed=bool(AUTH and request.cookies.get("awos_session")==AUTH)
     session_html=("<form method='post' action='/logout'><button>Sign out</button></form>" if signed else ("<a href='/login'>Sign in to run objectives</a>" if AUTH else ""))
     form=("<form method='post' action='/goals'><input name='title' required placeholder='Objective title'><textarea name='description' required placeholder='What should the workforce accomplish?'></textarea><textarea name='criteria' placeholder='Success criteria'></textarea><input name='budget' type='number' step='.01' placeholder='Budget USD'><button>Create & run</button></form>" if (not AUTH or signed) else "<p class='warning'>Private beta is enabled. Sign in before creating or running objectives.</p>")
-    return HTMLResponse(f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>{CSS}</style></head><body><main><h1>AI Workforce OS</h1><p class='muted'>v{APP_VERSION} Â· schema {SCHEMA_VERSION} Â· DB {esc(DB)}</p><div class='card'>{session_html}{form}</div><h2>Objectives</h2>{cards or 'None yet.'}</main></body></html>")
+    return html_response(f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>{CSS}</style></head><body><main><h1>AI Workforce OS</h1><p class='muted'>v{APP_VERSION} | schema {SCHEMA_VERSION} | DB {esc(DB)}</p><div class='card'>{session_html}{form}</div><h2>Objectives</h2>{cards or 'None yet.'}</main></body></html>")
 
 @app.post("/goals")
 async def create(request:Request):
@@ -861,15 +1053,15 @@ async function refresh(){
  const d=await rr.json(),g=d.goal;
  const pe=(d.events||[]).find(e=>['PLANNER_VALIDATED_AFTER_REPAIR','PLANNER_FALLBACK','PLANNER_COMPLETED'].includes(e.kind));
  let plannerLabel=g.planner_degraded?'DEGRADED FALLBACK':(pe&&pe.kind==='PLANNER_VALIDATED_AFTER_REPAIR'?'VALIDATED + REPAIRED':'VALIDATED');
- let h='<div class="card"><b>Status:</b> '+E(g.status)+' Â· <b>Spend:</b> $'+Number(g.spent||0).toFixed(4)+' / $'+Number(g.budget||0).toFixed(2)+' Â· <b>Verification:</b> '+E(g.verification_status||'â')+'<br>Planner: '+E(plannerLabel)+'</div>';
- h+='<div class="card"><h2>Task graph</h2>'+(d.tasks.map(t=>'<div class="task"><b>'+E(t.title)+'</b> <span class="badge">'+E(t.status)+'</span><div class="muted">attempts '+Number(t.attempts||0)+' Â· spend $'+Number(t.spent||0).toFixed(4)+' Â· confidence '+E(t.confidence??'â')+'</div>'+(t.error_message?'<div class="error">'+E(t.error_message)+'</div>':'')+'</div>').join('')||'No tasks created.')+'</div>';
+ let h='<div class="card"><b>Status:</b> '+E(g.status)+' | <b>Spend:</b> $'+Number(g.spent||0).toFixed(4)+' / $'+Number(g.budget||0).toFixed(2)+' | <b>Verification:</b> '+E(g.verification_status||'-')+'<br>Planner: '+E(plannerLabel)+'</div>';
+ h+='<div class="card"><h2>Task graph</h2>'+(d.tasks.map(t=>'<div class="task"><b>'+E(t.title)+'</b> <span class="badge">'+E(t.status)+'</span><div class="muted">id '+E(t.plan_id||'')+' | attempts '+Number(t.attempts||0)+' | spend $'+Number(t.spent||0).toFixed(4)+' | confidence '+E(t.confidence??'-')+'</div>'+(t.error_message?'<div class="error">'+E(t.error_message)+'</div>':'')+'</div>').join('')||'No tasks created.')+'</div>';
  h+='<div class="card"><h2>Evidence</h2>'+(d.evidence.map(e=>{const u=U(e.url);return '<div class="task"><b>'+E(e.title||'Source')+'</b><br>'+(u?'<a target="_blank" rel="noopener noreferrer" href="'+E(u)+'">'+E(u)+'</a>':'')+'</div>'}).join('')||'No evidence yet.')+'</div>';
  if(g.final_output)h+='<div class="card"><h2>Final output</h2><pre>'+E(g.final_output)+'</pre></div>';
- if(['failed','incomplete','interrupted'].includes(g.status))h+='<form method="post" action="/goals/%s/retry"><button>Retry</button></form>';
+ if(['queued','planning','executing','evaluating','replanning'].includes(g.status))h+='<form method="post" action="/goals/%s/cancel"><button>Cancel run</button></form>'; if(['failed','incomplete','interrupted'].includes(g.status))h+='<form method="post" action="/goals/%s/retry"><button>Retry</button></form>';
  document.getElementById('a').innerHTML=h;
  if(['queued','planning','executing','evaluating','replanning'].includes(g.status))setTimeout(refresh,3000)
-}refresh();</script></body></html>"""%(CSS,esc(g["title"]),gid,gid)
-    return HTMLResponse(html)
+}refresh();</script></body></html>"""%(CSS,esc(g["title"]),gid,gid,gid)
+    return html_response(html)
 
 @app.get("/api/goals/{gid}")
 def api(gid,request:Request):
