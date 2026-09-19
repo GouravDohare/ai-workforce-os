@@ -1,12 +1,12 @@
-import os, json, sqlite3, uuid, time, math, re, hashlib, threading, traceback, hmac
+import os, json, sqlite3, uuid, time, math, re, hashlib, threading, traceback, hmac, urllib.parse
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.20"
-SCHEMA_VERSION = "046-2"
+APP_VERSION = "0.4.21"
+SCHEMA_VERSION = "046-3"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
@@ -34,6 +34,8 @@ WORKER_INITIAL_TOKENS = int(os.getenv("WORKER_INITIAL_TOKENS", "2200"))
 WORKER_ESCALATED_TOKENS = int(os.getenv("WORKER_ESCALATED_TOKENS", "3200"))
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "24000"))
 MAX_EVIDENCE_ITEMS = int(os.getenv("MAX_EVIDENCE_ITEMS", "12"))
+MAX_CLAIMS = int(os.getenv("MAX_CLAIMS", "80"))
+MAX_CONTRADICTIONS = int(os.getenv("MAX_CONTRADICTIONS", "30"))
 MAX_UPSTREAM_CHARS = int(os.getenv("MAX_UPSTREAM_CHARS", "7000"))
 MAX_WEB_MEMO_CHARS = int(os.getenv("MAX_WEB_MEMO_CHARS", "8000"))
 MAX_MODEL_REQUEST_ESTIMATED_TOKENS = int(os.getenv("MAX_MODEL_REQUEST_ESTIMATED_TOKENS", "24000"))
@@ -171,6 +173,9 @@ def init():
         CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY,task_id TEXT,n INT,status TEXT,started_at TEXT,ended_at TEXT,latency_ms INT,input_tokens INT,output_tokens INT,cost REAL,model TEXT,error_type TEXT,error_message TEXT,request_id TEXT,strategy TEXT,tool_mode TEXT);
         CREATE TABLE IF NOT EXISTS model_calls(id TEXT PRIMARY KEY,run_id TEXT,task_id TEXT,purpose TEXT,model TEXT,tool_mode TEXT,status TEXT,started_at TEXT,ended_at TEXT,latency_ms INT,input_tokens INT,output_tokens INT,cost REAL,request_id TEXT,error_type TEXT,error_message TEXT,metadata TEXT);
         CREATE TABLE IF NOT EXISTS evidence(id TEXT PRIMARY KEY,run_id TEXT,task_id TEXT,claim TEXT,source_type TEXT,title TEXT,url TEXT,publisher TEXT,published_at TEXT,retrieved_at TEXT,snippet TEXT,state TEXT,confidence REAL,metadata TEXT);
+        CREATE TABLE IF NOT EXISTS claims(id TEXT PRIMARY KEY,run_id TEXT,task_id TEXT,claim TEXT,claim_type TEXT,normalized_key TEXT,values_json TEXT,source_ids TEXT,confidence REAL,status TEXT,created_at TEXT,updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS contradictions(id TEXT PRIMARY KEY,run_id TEXT,claim_a_id TEXT,claim_b_id TEXT,severity TEXT,reason TEXT,status TEXT,resolution TEXT,created_at TEXT,updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS budget_items(id TEXT PRIMARY KEY,run_id TEXT,task_id TEXT,label TEXT,amount REAL,currency TEXT,period TEXT,basis TEXT,source_ids TEXT,status TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY,run_id TEXT,task_id TEXT,name TEXT,type TEXT,version INT,content TEXT,hash TEXT,status TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS artifact_deps(id TEXT PRIMARY KEY,upstream_artifact TEXT,downstream_artifact TEXT,relationship TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS handoffs(id TEXT PRIMARY KEY,run_id TEXT,from_task TEXT,to_task TEXT,summary TEXT,evidence_ids TEXT,artifact_ids TEXT,assumptions TEXT,unknowns TEXT,confidence REAL,created_at TEXT);
@@ -444,10 +449,11 @@ PLAN={"type":"object","additionalProperties":False,"properties":{
 
 WORKER={"type":"object","additionalProperties":False,"properties":{
     "summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}},
-    "claims":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{"claim":{"type":"string"},"source_urls":{"type":"array","items":{"type":"string"}},"confidence":{"type":"number"}},"required":["claim","source_urls","confidence"]}},
+    "claims":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{"claim":{"type":"string"},"claim_type":{"type":"string","enum":["fact","estimate","assumption","recommendation"]},"source_urls":{"type":"array","items":{"type":"string"}},"confidence":{"type":"number"}},"required":["claim","claim_type","source_urls","confidence"]}},
+    "budget":{"type":["object","null"],"additionalProperties":False,"properties":{"currency":{"type":"string"},"period":{"type":"string"},"total":{"type":["number","null"]},"basis":{"type":"string"},"status":{"type":"string","enum":["verified","estimated","assumption","unresolved","not_applicable"]},"items":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{"label":{"type":"string"},"amount":{"type":"number"},"currency":{"type":"string"},"period":{"type":"string"},"basis":{"type":"string"},"source_urls":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["verified","estimated","assumption","unresolved"]}},"required":["label","amount","currency","period","basis","source_urls","status"]}}},"required":["currency","period","total","basis","status","items"]},
     "assumptions":{"type":"array","items":{"type":"string"}},"unknowns":{"type":"array","items":{"type":"string"}},"requires_validation":{"type":"array","items":{"type":"string"}},"insufficient_evidence":{"type":"array","items":{"type":"string"}},"risks":{"type":"array","items":{"type":"string"}},"next_actions":{"type":"array","items":{"type":"string"}},
     "artifact":{"type":["object","null"],"additionalProperties":False,"properties":{"name":{"type":"string"},"type":{"type":"string"},"content":{"type":"string"}},"required":["name","type","content"]}
-},"required":["summary","findings","claims","assumptions","unknowns","requires_validation","insufficient_evidence","risks","next_actions","artifact"]}
+},"required":["summary","findings","claims","budget","assumptions","unknowns","requires_validation","insufficient_evidence","risks","next_actions","artifact"]}
 
 EVAL={"type":"object","additionalProperties":False,"properties":{
     "passed":{"type":"boolean"},"score":{"type":"number"},"dimensions":{"type":"object","additionalProperties":False,"properties":{"criteria":{"type":"number"},"evidence":{"type":"number"},"contradictions":{"type":"number"},"completeness":{"type":"number"}},"required":["criteria","evidence","contradictions","completeness"]},
@@ -807,7 +813,7 @@ def extract_sources(r):
         if isinstance(v,dict):
             url=v.get("url") or v.get("source_url") or v.get("source_website_url")
             if isinstance(url,str) and url.startswith(("http://","https://")):
-                found.append({"url":url,"title":v.get("title") or v.get("name") or url,"publisher":v.get("publisher") or v.get("domain")})
+                found.append({"url":url,"title":v.get("title") or v.get("name") or url,"publisher":v.get("publisher") or v.get("domain"),"published_at":v.get("published_at") or v.get("publishedAt") or v.get("date") or v.get("published_date"),"snippet":v.get("snippet") or v.get("description")})
             for key in ("output","content","action","sources","results","items"):
                 if key in v: walk(v.get(key),depth+1)
             return
@@ -821,7 +827,7 @@ def extract_sources(r):
                 if hasattr(v,key):
                     vv=getattr(v,key)
                     if key in {"url","source_url","source_website_url"} and isinstance(vv,str) and vv.startswith(("http://","https://")):
-                        found.append({"url":vv,"title":getattr(v,"title",None) or getattr(v,"name",None) or vv,"publisher":getattr(v,"publisher",None) or getattr(v,"domain",None)})
+                        found.append({"url":vv,"title":getattr(v,"title",None) or getattr(v,"name",None) or vv,"publisher":getattr(v,"publisher",None) or getattr(v,"domain",None),"published_at":getattr(v,"published_at",None) or getattr(v,"publishedAt",None) or getattr(v,"date",None) or getattr(v,"published_date",None),"snippet":getattr(v,"snippet",None) or getattr(v,"description",None)})
                     elif key not in {"url","source_url","source_website_url","title","name","publisher","domain"}:
                         walk(vv,depth+1)
             except Exception:
@@ -836,15 +842,107 @@ def extract_sources(r):
         if u not in uniq or (uniq[u].get("title")==u and z.get("title")!=u): uniq[u]=z
     return list(uniq.values())
 
+def source_quality(url, publisher=None):
+    """Deterministic provenance tier; descriptive metadata, not a truth score."""
+    try:
+        host=re.sub(r"^www\\.","",urllib.parse.urlparse(url).hostname or "").lower()
+    except Exception:
+        host=""
+    primary_domains=("gov","mil","edu")
+    high_domains=("who.int","worldbank.org","oecd.org","census.gov","bls.gov","sec.gov","ec.europa.eu","europa.eu")
+    tier=4
+    if any(host.endswith("."+d) or host==d for d in primary_domains): tier=1
+    elif any(host==d or host.endswith("."+d) for d in high_domains): tier=1
+    elif publisher: tier=2
+    elif host: tier=3
+    return {"tier":tier,"domain":host,"basis":"official_or_primary" if tier==1 else "publisher_metadata" if tier==2 else "domain_only" if tier==3 else "unknown"}
+
 def save_sources(rid,tid,r):
     ids=[]
     for src in extract_sources(r):
         row=q("SELECT id FROM evidence WHERE run_id=? AND url=?",(rid,src["url"]),one=True)
         if row: ids.append(row["id"]); continue
         eid=uid("evi")
-        x("INSERT INTO evidence(id,run_id,task_id,claim,source_type,title,url,publisher,published_at,retrieved_at,snippet,state,confidence,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(eid,rid,tid,"Source returned by web search","web",src["title"],src["url"],src.get("publisher"),None,now(),None,"captured",None,jd({})))
+        meta=source_quality(src["url"],src.get("publisher"))
+        meta.update({"retrieved_at":now(),"published_at":src.get("published_at")})
+        x("INSERT INTO evidence(id,run_id,task_id,claim,source_type,title,url,publisher,published_at,retrieved_at,snippet,state,confidence,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(eid,rid,tid,"Source returned by web search","web",src["title"],src["url"],src.get("publisher"),src.get("published_at"),now(),src.get("snippet"),"captured",None,jd(meta)))
         ids.append(eid)
     return ids
+
+def claim_key(text):
+    txt=re.sub(r"[^a-z0-9%$â¬Â£â¹. ]+"," ",str(text).lower())
+    txt=re.sub(r"\b\d+(?:[.,]\d+)?\b", " <num> ", txt)
+    stop={"the","a","an","of","and","or","for","to","in","on","with","from","is","are","was","were","this","that","than","by","per","about"}
+    toks=[x for x in txt.split() if x not in stop and len(x)>2]
+    return " ".join(toks[:24])
+
+def numeric_values(text):
+    vals=[]
+    pat=re.compile(r"(?P<cur>[$â¬Â£â¹])?\s*(?P<n>\d+(?:[.,]\d+)?)\s*(?P<unit>%|[kKmMbB])?")
+    for m in pat.finditer(str(text)):
+        try: n=float(m.group("n").replace(",",""))
+        except Exception: continue
+        unit=(m.group("unit") or "").lower()
+        mult={"k":1e3,"m":1e6,"b":1e9}.get(unit,1.0)
+        vals.append({"value":n*mult,"display":m.group(0).strip(),"currency":m.group("cur") or "","unit":unit})
+    return vals
+
+def register_claims_and_budget(rid,tid,d):
+    ev=q("SELECT id,url FROM evidence WHERE run_id=?",(rid,)); by={e["url"]:e["id"] for e in ev}
+    for c in d.get("claims",[]) or []:
+        claim=str(c.get("claim") or "").strip()
+        if not claim: continue
+        src_ids=[by[u] for u in c.get("source_urls",[]) if u in by]
+        vals=numeric_values(claim)
+        cid=uid("clm")
+        x("INSERT INTO claims(id,run_id,task_id,claim,claim_type,normalized_key,values_json,source_ids,confidence,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(cid,rid,tid,claim,str(c.get("claim_type") or "fact"),claim_key(claim),jd(vals),jd(src_ids),float(c.get("confidence",0.5) or 0.5),"supported" if src_ids else "unsupported",now(),now()))
+    b=d.get("budget")
+    if isinstance(b,dict) and str(b.get("status"))!="not_applicable":
+        urls=by
+        for item in b.get("items",[]) or []:
+            src_ids=[urls[u] for u in item.get("source_urls",[]) if u in urls]
+            x("INSERT INTO budget_items(id,run_id,task_id,label,amount,currency,period,basis,source_ids,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(uid("bud"),rid,tid,str(item.get("label") or ""),float(item.get("amount",0) or 0),str(item.get("currency") or b.get("currency") or "USD"),str(item.get("period") or b.get("period") or ""),str(item.get("basis") or b.get("basis") or ""),jd(src_ids),str(item.get("status") or b.get("status") or "estimated"),now()))
+
+def detect_numeric_contradictions(rid):
+    rows=q("SELECT * FROM claims WHERE run_id=? AND status<>'resolved' ORDER BY created_at LIMIT ?",(rid,MAX_CLAIMS))
+    created=[]
+    seen=set()
+    for i,a in enumerate(rows):
+        av=jl(a["values_json"],[]) or []
+        if not av: continue
+        at=set(claim_key(a["claim"]).split())
+        for b in rows[i+1:]:
+            key=tuple(sorted((a["id"],b["id"])))
+            if key in seen: continue
+            bv=jl(b["values_json"],[]) or []
+            if not bv: continue
+            bt=set(claim_key(b["claim"]).split())
+            overlap=len(at&bt)/max(1,min(len(at),len(bt)))
+            if overlap<0.55: continue
+            # Compare the first compatible numeric value. Large differences are conflicts;
+            # near-equal rounded figures are not.
+            conflict=None
+            for x1 in av:
+                for x2 in bv:
+                    if x1.get("currency") and x2.get("currency") and x1.get("currency")!=x2.get("currency"): continue
+                    v1=float(x1.get("value",0));v2=float(x2.get("value",0))
+                    if v1==0 and v2==0: continue
+                    ratio=max(abs(v1-v2)/max(abs(v1),abs(v2),1e-9),0)
+                    if ratio>=0.20:
+                        conflict=(x1,x2,ratio);break
+                if conflict: break
+            if not conflict: continue
+            reason=f"Numeric claims share the same subject context but differ materially ({conflict[0].get('display')} vs {conflict[1].get('display')}); scope/date/definition must be reconciled."
+            existing=q("SELECT id FROM contradictions WHERE run_id=? AND ((claim_a_id=? AND claim_b_id=?) OR (claim_a_id=? AND claim_b_id=?))",(rid,a["id"],b["id"],b["id"],a["id"]),one=True)
+            if existing: continue
+            cid=uid("con");x("INSERT INTO contradictions(id,run_id,claim_a_id,claim_b_id,severity,reason,status,resolution,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(cid,rid,a["id"],b["id"],"high" if conflict[2]>=0.5 else "medium",reason,"unresolved",None,now(),now()))
+            created.append({"id":cid,"claim":a["claim"],"other_claim":b["claim"],"reason":reason})
+            seen.add(key)
+            if len(created)>=MAX_CONTRADICTIONS: return created
+    return created
+
+def contradiction_summary(rid):
+    return [dict(x) for x in q("SELECT c.id,c.severity,c.reason,c.status,a.claim claim_a,b.claim claim_b FROM contradictions c JOIN claims a ON a.id=c.claim_a_id JOIN claims b ON b.id=c.claim_b_id WHERE c.run_id=? ORDER BY c.created_at DESC LIMIT ?",(rid,MAX_CONTRADICTIONS))]
 
 def update_claim_evidence(rid,tid,d):
     ev=q("SELECT id,url FROM evidence WHERE run_id=?",(rid,)); by={e["url"]:e["id"] for e in ev}
@@ -855,16 +953,16 @@ def update_claim_evidence(rid,tid,d):
 def context(rid,t):
     g=get_goal_from_run(rid)
     ds=q("SELECT d.*,u.title,u.status,u.output,u.structured FROM deps d JOIN tasks u ON u.id=d.upstream WHERE d.run_id=? AND d.downstream=? ORDER BY d.id",(rid,t["id"]))
-    ev=q("SELECT id,title,url,publisher,claim,retrieved_at,confidence FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))
+    ev=q("SELECT id,title,url,publisher,claim,retrieved_at,confidence,published_at,metadata FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))
     mem=q("SELECT type,key,value,confidence FROM memory WHERE company_id=? AND (goal_id=? OR goal_id IS NULL) ORDER BY updated_at DESC LIMIT 10",(g["company_id"],g["id"]))
     deps=[]
     for d in ds:
         deps.append({"plan_id":d["upstream"],"title":d["title"],"status":d["status"],"output":clip(d["output"],MAX_UPSTREAM_CHARS),"structured":clip(jd(jl(d["structured"])),MAX_UPSTREAM_CHARS)})
-    evidence=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"claim":clip(e["claim"],500),"retrieved_at":e["retrieved_at"],"confidence":e["confidence"]} for e in ev]
+    evidence=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"claim":clip(e["claim"],500),"retrieved_at":e["retrieved_at"],"published_at":e["published_at"],"confidence":e["confidence"],"provenance":jl(e["metadata"],{})} for e in ev]
     memory=[{"type":m["type"],"key":m["key"],"value":clip(m["value"],700),"confidence":m["confidence"]} for m in mem]
     peers=q("SELECT plan_id,title,status,output,structured FROM tasks WHERE run_id=? AND id<>? AND status='completed' ORDER BY updated_at DESC LIMIT 6",(rid,t["id"]))
     peer_work=[{"plan_id":p["plan_id"],"title":clip(p["title"],180),"output":clip(p["output"],1400),"structured":clip(jd(jl(p["structured"])),1800)} for p in peers]
-    return {"objective":clip(g["title"],500),"description":clip(g["description"],4000),"criteria":clip(g["criteria"],5000),"task":{"title":clip(t["title"],500),"instructions":clip(t["instructions"],4000),"contract":jl(t["contract"])},"dependencies":deps,"peer_work":peer_work,"evidence":evidence,"memory":memory}
+    return {"objective":clip(g["title"],500),"description":clip(g["description"],4000),"criteria":clip(g["criteria"],5000),"workforce_execution_budget_usd":float(g["budget"]),"task":{"title":clip(t["title"],500),"instructions":clip(t["instructions"],4000),"contract":jl(t["contract"])},"dependencies":deps,"peer_work":peer_work,"evidence":evidence,"memory":memory,"contradictions":contradiction_summary(rid)}
 
 def art(rid,tid,name,content,typ="text"):
     aid=uid("art"); v=q("SELECT COALESCE(MAX(version),0) v FROM artifacts WHERE run_id=? AND name=?",(rid,name),one=True)["v"]+1
@@ -969,6 +1067,10 @@ def task_run(rid,tid):
                         d["summary"]=re.sub(r"(?i)\b(completed|conducted|launched|deployed)\b", "planned", str(d.get("summary") or ""))
                         event(rid,"ACTION_CLAIM_GUARDED","unsupported external-action completion language detected and downgraded to validation-pending",{"action_type":action_type},tid)
                 d=update_claim_evidence(rid,tid,d)
+                register_claims_and_budget(rid,tid,d)
+                new_conflicts=detect_numeric_contradictions(rid)
+                if new_conflicts:
+                    event(rid,"CONTRADICTIONS_DETECTED","numeric claim contradictions detected",{"count":len(new_conflicts),"items":new_conflicts},tid)
                 claims=d.get("claims",[])
                 evidence_ids=sorted(set(sum([c.get("evidence_ids",[]) for c in claims],[])))
                 if int(t["requires_web"]) and jl(t["contract"]).get("evidence_required") and not evidence_ids:
@@ -1135,7 +1237,10 @@ def normalize_verification_result(d,g,task_view):
 def evaluate(rid,stage):
     g=get_goal_from_run(rid); ts=q("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at",(rid,))
     task_view=[{"id":t["plan_id"],"title":t["title"],"status":t["status"],"required":bool(t["required"]),"action_type":str((jl(t["contract"]) or {}).get("action_type") or ""),"allowed_tools":list((jl(t["contract"]) or {}).get("allowed_tools") or []),"output":clip(t["output"],3000),"structured":clip(jd(jl(t["structured"])),4500),"confidence":t["confidence"]} for t in ts]
-    ev_view=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"confidence":e["confidence"]} for e in q("SELECT id,title,url,publisher,confidence FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]
+    ev_view=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"published_at":e["published_at"],"confidence":e["confidence"],"provenance":jl(e["metadata"],{})} for e in q("SELECT id,title,url,publisher,published_at,confidence,metadata FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]
+    claim_view=[dict(c) for c in q("SELECT id,task_id,claim,claim_type,values_json,source_ids,confidence,status FROM claims WHERE run_id=? ORDER BY created_at DESC LIMIT ?",(rid,MAX_CLAIMS))]
+    conflict_view=contradiction_summary(rid)
+    budget_view=[dict(b) for b in q("SELECT id,task_id,label,amount,currency,period,basis,source_ids,status FROM budget_items WHERE run_id=? ORDER BY created_at",(rid,))]
     prompt=f"""You are the independent verification layer for an AI workforce.
 Evaluate whether the WORKFORCE'S DELIVERED WORK actually satisfies the stated objective and success criteria.
 Do not equate a task marked completed with the real-world action having occurred. Inspect each task contract.action_type. A validation_plan is a deliverable about how to perform an action, not evidence that the action occurred. An external_action or approval_required task may be treated as executed only when the task output includes verifiable tool evidence/artifacts proving the side effect. Agents cannot claim that customer interviews, paid campaigns, purchases, deployments, outreach, experiments, or other external side effects happened without such proof. When unsupported execution language appears, treat it as a verification failure and require correction rather than merely recommending future validation.
@@ -1148,12 +1253,22 @@ A validation_plan task must NOT claim to have run the interview/experiment/campa
 OBJECTIVE: {clip(g['title'],500)}
 DESCRIPTION: {clip(g['description'],4000)}
 SUCCESS CRITERIA: {clip(g['criteria'],5000)}
+WORKFORCE EXECUTION BUDGET: ${float(g['budget']):.4f}. This is ONLY the AI/API spend cap for this run, NOT the business launch budget. Never treat it as a business funding figure.
 TASKS: {jd(task_view)}
 EVIDENCE: {jd(ev_view)}
+CLAIM REGISTRY: {jd(claim_view)}
+DETECTED CONTRADICTIONS: {jd(conflict_view)}
+STRUCTURED BUSINESS BUDGET ITEMS: {jd(budget_view)}
 Return only the evaluator JSON schema. For planning/strategy objectives, PASS means the requested deliverable is substantively covered, no criterion is FAIL, required tasks are completed, assumptions/unknowns are labeled, evidence is adequate for factual claims, and no unsupported real-world action is presented as completed. For execution objectives, apply the stronger execution standard."""
     try:
         o=call(rid,None,"evaluator",prompt,MODEL,False,("evaluation",EVAL),3000,min(1.0,max(.05,g["budget"]*.14)))
         d=parse_json(o["text"])
+        deterministic_conflicts=contradiction_summary(rid)
+        existing_pairs={(str(c.get("claim")),str(c.get("other_claim"))) for c in (d.get("contradictions") or [])}
+        for c in deterministic_conflicts:
+            pair=(str(c.get("claim_a")),str(c.get("claim_b")))
+            if pair not in existing_pairs and (pair[::-1] not in existing_pairs):
+                d.setdefault("contradictions",[]).append({"claim":c.get("claim_a"),"other_claim":c.get("claim_b"),"reason":c.get("reason")})
         task_view_for_policy=[{"id":t["plan_id"],"title":t["title"],"status":t["status"],"required":bool(t["required"]),"action_type":str((jl(t["contract"]) or {}).get("action_type") or ""),"allowed_tools":list((jl(t["contract"]) or {}).get("allowed_tools") or [])} for t in ts]
         d=normalize_verification_result(d,g,task_view_for_policy)
         criteria=d.get("criterion_results") or []
@@ -1322,15 +1437,22 @@ def execute(rid):
             raise RuntimeError("run deadline exceeded before final report")
         ts=q("SELECT * FROM tasks WHERE run_id=? AND status='completed'",(rid,))
         report_tasks=[{"title":t["title"],"output":clip(t["output"],3500),"structured":clip(jd(jl(t["structured"])),5000)} for t in ts]
-        report_evidence=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120)} for e in q("SELECT id,title,url,publisher FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]
+        report_evidence=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"published_at":e["published_at"],"provenance":jl(e["metadata"],{})} for e in q("SELECT id,title,url,publisher,published_at,metadata FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]
+        report_claims=[dict(c) for c in q("SELECT id,task_id,claim,claim_type,values_json,source_ids,confidence,status FROM claims WHERE run_id=? ORDER BY created_at DESC LIMIT ?",(rid,MAX_CLAIMS))]
+        report_conflicts=contradiction_summary(rid)
+        report_budgets=[dict(b) for b in q("SELECT id,task_id,label,amount,currency,period,basis,source_ids,status FROM budget_items WHERE run_id=? ORDER BY created_at",(rid,))]
         latest_eval=q("SELECT * FROM evaluations WHERE run_id=? ORDER BY created_at DESC LIMIT 1",(rid,),one=True)
         eval_summary=jl(latest_eval["failures"],{}) if latest_eval else {}
         report_prompt=f"""Write the final decision-ready report for {clip(g['title'],500)}.
 SUCCESS CRITERIA: {clip(g['criteria'],5000)}
+WORKFORCE EXECUTION BUDGET: ${float(g['budget']):.4f}. This is ONLY the AI/API spend cap for producing this report. It is NOT the business launch budget, funding requirement, staffing budget, or customer acquisition budget. Never describe it as one.
 VERIFIED TASKS: {jd(report_tasks)}
-EVIDENCE: {jd(report_evidence)}
+EVIDENCE WITH PROVENANCE: {jd(report_evidence)}
+CLAIM REGISTRY: {jd(report_claims)}
+DETECTED CONTRADICTIONS: {jd(report_conflicts)}
+STRUCTURED BUSINESS BUDGET ITEMS: {jd(report_budgets)}
 VERIFICATION SUMMARY: {clip(jd(eval_summary),7000)}
-Never invent facts. Address every criterion explicitly and distinguish verified facts, estimates, assumptions, unknowns, and unresolved risks. Do not turn proposed validation steps into claims that the validation already occurred."""
+Never invent facts or source details. For every important numerical/current factual claim, cite the supporting source from the evidence/claim registry and distinguish verified facts, estimates, assumptions, recommendations, unknowns, and unresolved contradictions. If sources disagree, explain the scope/date/definition difference or explicitly preserve the conflict; never silently choose one number. Treat the workforce execution budget as unrelated to the business budget. Do not turn proposed validation steps into claims that validation already occurred."""
         report=report_call(rid,report_prompt,min(1.0,g["budget"]*.18))["text"]
         x("UPDATE goals SET final_output=?,status='completed',verification_status='passed',updated_at=? WHERE id=?",(report,now(),g["id"]))
         x("UPDATE runs SET status='completed',ended_at=? WHERE id=?",(now(),rid));event(rid,"GOAL_COMPLETED","verified final report delivered")
@@ -1405,7 +1527,7 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"planner_initial_tokens":PLANNER_INITIAL_TOKENS,"planner_escalated_tokens":PLANNER_ESCALATED_TOKENS,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"planner_runtime_normalization":True,"verification_engine":"criterion_level_revision_v2_action_safe","version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"planner_initial_tokens":PLANNER_INITIAL_TOKENS,"planner_escalated_tokens":PLANNER_ESCALATED_TOKENS,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"planner_runtime_normalization":True,"verification_engine":"criterion_level_revision_v2_action_safe","claim_registry":True,"contradiction_registry":True,"structured_business_budget":True,"version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
 def dg(request:Request):
@@ -1436,6 +1558,11 @@ def dverify(rid,request:Request):
     ev=q("SELECT * FROM evaluations WHERE run_id=? ORDER BY created_at DESC LIMIT 5",(rid,))
     return {"status":"ok","version":APP_VERSION,"goal":{"id":g["id"],"status":g["status"],"verification_status":g["verification_status"]},"evaluations":[dict(e) for e in ev],"events":[dict(e) for e in q("SELECT kind,message,payload,created_at FROM events WHERE run_id=? AND kind LIKE 'VERIFICATION%' ORDER BY created_at DESC LIMIT 20",(rid,))]}
 
+@app.get("/diagnostics/provenance/{rid}")
+def dprov(rid,request:Request):
+    auth(request)
+    return {"status":"ok","version":APP_VERSION,"claims":[dict(c) for c in q("SELECT * FROM claims WHERE run_id=? ORDER BY created_at DESC LIMIT ?",(rid,MAX_CLAIMS))],"contradictions":contradiction_summary(rid),"budget_items":[dict(b) for b in q("SELECT * FROM budget_items WHERE run_id=? ORDER BY created_at",(rid,))],"evidence":[dict(e) for e in q("SELECT * FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]}
+
 @app.get("/diagnostics/run/{rid}")
 def drun(rid,request:Request):
     auth(request)
@@ -1443,7 +1570,7 @@ def drun(rid,request:Request):
     ev=q("SELECT kind,message,payload,created_at,task_id FROM events WHERE run_id=? ORDER BY created_at DESC LIMIT 40",(rid,))
     mc=q("SELECT purpose,status,model,tool_mode,started_at,ended_at,latency_ms,input_tokens,output_tokens,cost,request_id,error_type,error_message FROM model_calls WHERE run_id=? ORDER BY started_at DESC LIMIT 20",(rid,))
     ts=q("SELECT id,title,status,attempts,error_type,error_message,updated_at FROM tasks WHERE run_id=? ORDER BY created_at",(rid,))
-    return {"status":"ok","version":APP_VERSION,"run":dict(r),"goal":{"id":g["id"],"title":g["title"],"status":g["status"],"spent":g["spent"],"budget":g["budget"]},"events":[dict(e) for e in ev],"model_calls":[dict(m) for m in mc],"tasks":[dict(t) for t in ts]}
+    return {"status":"ok","version":APP_VERSION,"run":dict(r),"goal":{"id":g["id"],"title":g["title"],"status":g["status"],"spent":g["spent"],"budget":g["budget"]},"events":[dict(e) for e in ev],"model_calls":[dict(m) for m in mc],"tasks":[dict(t) for t in ts],"claims":[dict(c) for c in q("SELECT id,task_id,claim,claim_type,values_json,source_ids,confidence,status FROM claims WHERE run_id=? ORDER BY created_at DESC LIMIT ?",(rid,MAX_CLAIMS))],"contradictions":contradiction_summary(rid),"budget_items":[dict(b) for b in q("SELECT * FROM budget_items WHERE run_id=? ORDER BY created_at",(rid,))]}
 
 @app.get("/")
 def home(request:Request):
@@ -1480,6 +1607,7 @@ async function refresh(){
  const latest=(d.evaluations||[])[0];
  if(latest){let fails=[]; try{fails=JSON.parse(latest.failures||'{}').criterion_results||[]}catch(_){}; h+='<div class="card"><h2>Verification details</h2><div class="muted">stage '+E(latest.stage||'')+' | score '+Number(latest.score||0).toFixed(2)+' | '+(latest.passed?'passed':'failed')+'</div>'; if(fails.length){h+='<div class="task"><b>Criterion review</b>'+fails.map(c=>'<div style="margin-top:8px"><b>'+E(c.status||'')+'</b> â '+E(c.criterion||'')+'<div class="muted">'+E(c.reason||'')+'</div>'+(c.evidence_needed?'<div class="muted">Evidence/action: '+E(c.evidence_needed)+'</div>':'')+'</div>').join('')+'</div>';} h+='</div>';}
  h+='<div class="card"><h2>Evidence</h2>'+(d.evidence.map(e=>{const u=U(e.url);let host='';let title=E(e.title||'Source');try{if(u){host=new URL(u).hostname.replace('www.','');if(!e.title||String(e.title).toLowerCase().indexOf('http://')===0||String(e.title).toLowerCase().indexOf('https://')===0) title=E(host+' source');}}catch(_){}return '<div class="task"><b>'+title+'</b>'+(e.publisher?'<div class="muted">'+E(e.publisher)+'</div>':'')+(u?'<div class="muted">'+E(host)+'</div><a target="_blank" rel="noopener noreferrer" href="'+E(u)+'">Open source</a>':'')+'</div>'}).join('')||'No evidence yet.')+'</div>';
+ h+='<div class="card"><h2>Claim & contradiction integrity</h2>'+(d.contradictions&&d.contradictions.length?d.contradictions.map(c=>'<div class="task error"><b>Conflict</b><div>'+E(c.claim_a||c.claim||'')+'</div><div>'+E(c.claim_b||c.other_claim||'')+'</div><div class="muted">'+E(c.reason||'')+'</div></div>').join(''):'<p class="muted">No unresolved contradictions detected.</p>')+'</div>';
  if(g.final_output)h+='<div class="card"><h2>Final output</h2><pre>'+E(g.final_output)+'</pre></div>';
  if(['queued','planning','executing','evaluating','replanning'].includes(g.status))h+='<form method="post" action="/goals/%s/cancel"><button>Cancel run</button></form>'; if(['failed','incomplete','interrupted'].includes(g.status))h+='<form method="post" action="/goals/%s/retry"><button>Retry</button></form>';
  document.getElementById('a').innerHTML=h;
@@ -1490,7 +1618,7 @@ async function refresh(){
 @app.get("/api/goals/{gid}")
 def api(gid,request:Request):
     auth(request);g=gro(gid);rid=g["run_id"];ts=q("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at",(rid,)) if rid else []
-    return {"goal":dict(g)|{"app_version":APP_VERSION,"schema_version":SCHEMA_VERSION},"tasks":[dict(t)|{"contract":jl(t["contract"]),"structured":jl(t["structured"])} for t in ts],"evidence":[dict(e) for e in q("SELECT * FROM evidence WHERE run_id=?",(rid,))] if rid else [],"evaluations":[dict(e) for e in q("SELECT * FROM evaluations WHERE run_id=? ORDER BY created_at DESC",(rid,))] if rid else [],"handoffs":[dict(h) for h in q("SELECT * FROM handoffs WHERE run_id=?",(rid,))] if rid else [],"events":[dict(e) for e in q("SELECT * FROM events WHERE run_id=? ORDER BY created_at DESC LIMIT 100",(rid,))] if rid else []}
+    return {"goal":dict(g)|{"app_version":APP_VERSION,"schema_version":SCHEMA_VERSION},"tasks":[dict(t)|{"contract":jl(t["contract"]),"structured":jl(t["structured"])} for t in ts],"evidence":[dict(e) for e in q("SELECT * FROM evidence WHERE run_id=?",(rid,))] if rid else [],"claims":[dict(c) for c in q("SELECT * FROM claims WHERE run_id=? ORDER BY created_at DESC",(rid,))] if rid else [],"contradictions":contradiction_summary(rid) if rid else [],"budget_items":[dict(b) for b in q("SELECT * FROM budget_items WHERE run_id=? ORDER BY created_at",(rid,))] if rid else [],"evaluations":[dict(e) for e in q("SELECT * FROM evaluations WHERE run_id=? ORDER BY created_at DESC",(rid,))] if rid else [],"handoffs":[dict(h) for h in q("SELECT * FROM handoffs WHERE run_id=?",(rid,))] if rid else [],"events":[dict(e) for e in q("SELECT * FROM events WHERE run_id=? ORDER BY created_at DESC LIMIT 100",(rid,))] if rid else []}
 
 @app.post("/goals/{gid}/retry")
 def retry(gid,request:Request):
