@@ -5,12 +5,11 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.14"
+APP_VERSION = "0.4.12"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-WORKER_MODEL = os.getenv("OPENAI_WORKER_MODEL", "gpt-4.1-mini")
 WEB = os.getenv("ENABLE_WEB_RESEARCH", "true").lower() == "true"
 TIMEOUT = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "150"))
 DEFAULT_BUDGET = float(os.getenv("DEFAULT_GOAL_BUDGET_USD", "5"))
@@ -42,8 +41,6 @@ MODEL_CALL_TIMEOUT = float(os.getenv("MODEL_CALL_TIMEOUT_SECONDS", "150"))
 RESEARCH_TIMEOUT = float(os.getenv("RESEARCH_TIMEOUT_SECONDS", "180"))
 RESEARCH_INITIAL_TOKENS = int(os.getenv("RESEARCH_INITIAL_TOKENS", "1200"))
 RESEARCH_ESCALATED_TOKENS = int(os.getenv("RESEARCH_ESCALATED_TOKENS", "1600"))
-WORKER_INITIAL_TOKENS = int(os.getenv("WORKER_INITIAL_TOKENS", "1600"))
-WORKER_ESCALATED_TOKENS = int(os.getenv("WORKER_ESCALATED_TOKENS", "2400"))
 
 app = FastAPI(title="AI Workforce OS", version=APP_VERSION)
 lock = threading.RLock()
@@ -111,40 +108,21 @@ def esc(s):
             .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;"))
 
 def canonical_condition(value):
-    """Map planner prose conditions to the small runtime condition vocabulary.
-
-    The planner may express the same dependency in natural language, e.g.
-    ``T1 outputs accepted by CEO`` or ``after T1 is reviewed``. The dependency
-    edge already identifies the upstream task, so positive completion/acceptance
-    language is semantically equivalent to ``completed``. Negative language is
-    deliberately rejected rather than silently inverted.
-    """
-    raw = str(value or "").strip().lower()
-    v = re.sub(r"[^a-z0-9]", "", raw)
+    v = re.sub(r"[^a-z]", "", str(value or "").lower())
     aliases = {
         "completed":"completed", "complete":"completed", "done":"completed",
         "success":"completed", "successful":"completed", "succeeded":"completed",
         "provided":"completed", "outputprovided":"completed", "outputsprovided":"completed",
         "available":"completed", "outputsavailable":"completed", "resultprovided":"completed",
-        "finished":"completed", "ready":"completed", "produced":"completed",
-        "generated":"completed", "delivered":"completed", "received":"completed",
-        "accepted":"completed", "approved":"completed", "validated":"completed",
-        "reviewed":"completed", "verified":"completed", "checked":"completed",
-        "submitted":"completed", "handedoff":"completed", "handoff":"completed",
+        "finished":"completed", "ready":"completed",
         "optional":"optional", "optionally":"optional"
     }
     if v in aliases:
         return aliases[v]
-    if any(x in v for x in ("notcomplete", "notcompleted", "failed", "rejected", "unavailable", "missing")):
-        return None
-    # Positive state phrases embedded in planner prose.
-    positive = (
-        "provided", "available", "ready", "complete", "completed", "finished",
-        "done", "successful", "succeeded", "produced", "generated", "delivered",
-        "received", "accepted", "approved", "validated", "reviewed", "verified",
-        "checked", "submitted", "handedoff", "handoff"
-    )
-    if any(word in v for word in positive):
+    # Planners sometimes encode the dependency itself in prose, e.g.
+    # "T1 outputs provided". The DAG already stores the upstream task ID, so
+    # the runtime condition is simply that the upstream task completed.
+    if re.search(r"(?:provided|available|ready|complete|completed|finished|done|successful|succeeded)$", v):
         return "completed"
     return None
 
@@ -361,7 +339,7 @@ def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,sp
     try:
         client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"),timeout=call_timeout,max_retries=0)
         kw={"model":model,"input":prompt,"max_output_tokens":tokens}
-        if not web and model.startswith("gpt-5"):
+        if not web:
             kw["reasoning"]={"effort":"minimal"}
         if schema:
             kw["text"]={"format":{"type":"json_schema","name":schema[0],"schema":schema[1],"strict":True}}
@@ -459,10 +437,11 @@ WORKER={"type":"object","additionalProperties":False,"properties":{
 
 EVAL={"type":"object","additionalProperties":False,"properties":{
     "passed":{"type":"boolean"},"score":{"type":"number"},"dimensions":{"type":"object","additionalProperties":False,"properties":{"criteria":{"type":"number"},"evidence":{"type":"number"},"contradictions":{"type":"number"},"completeness":{"type":"number"}},"required":["criteria","evidence","contradictions","completeness"]},
+    "criterion_results":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{"criterion":{"type":"string"},"status":{"type":"string","enum":["pass","partial","fail"]},"reason":{"type":"string"},"evidence_needed":{"type":"string"}},"required":["criterion","status","reason","evidence_needed"]}},
     "failed_checks":{"type":"array","items":{"type":"string"}},"recommendations":{"type":"array","items":{"type":"string"}},
     "contradictions":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{"claim":{"type":"string"},"other_claim":{"type":"string"},"reason":{"type":"string"}},"required":["claim","other_claim","reason"]}},
-    "replan_tasks":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{"title":{"type":"string"},"reason":{"type":"string"}},"required":["title","reason"]}}
-},"required":["passed","score","dimensions","failed_checks","recommendations","contradictions","replan_tasks"]}
+    "replan_tasks":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{"title":{"type":"string"},"reason":{"type":"string"},"requires_web":{"type":"boolean"},"action_type":{"type":"string","enum":["evidence_research","analysis","validation_plan"]}},"required":["title","reason","requires_web","action_type"]}}
+},"required":["passed","score","dimensions","criterion_results","failed_checks","recommendations","contradictions","replan_tasks"]}
 
 def repair_plan(p, rid=None):
     """Repair only deterministic, semantics-preserving planner inconsistencies."""
@@ -594,32 +573,6 @@ def normalize_plan_budgets(p, budget, rid=None):
         event(rid,"PLAN_BUDGET_NORMALIZED","task budgets normalized to the goal budget",
               {"goal_budget":budget,"task_budget_pool":task_budget,"changes":changes,"total":round(sum(vals),4)})
         print(f"PLAN_BUDGET_NORMALIZED run={rid} total={sum(vals):.4f} budget={budget:.4f} changes={len(changes)}",flush=True)
-    return p,changes
-
-def normalize_plan_contracts(p, rid=None):
-    """Normalize planner-generated execution controls without changing task meaning.
-    Time limits and retry counts are operational controls, so malformed values are
-    clamped to safe runtime bounds instead of forcing an otherwise usable plan into
-    deterministic fallback.
-    """
-    changes=[]
-    for t in p.get("tasks",[]):
-        ct=t.setdefault("contract",{})
-        try: old_t=int(ct.get("time_limit_seconds",120))
-        except Exception: old_t=120
-        new_t=max(30,min(900,old_t))
-        if old_t != new_t:
-            changes.append({"task_id":t.get("id"),"field":"contract.time_limit_seconds","from":old_t,"to":new_t})
-        ct["time_limit_seconds"]=new_t
-        try: old_a=int(t.get("max_attempts",2))
-        except Exception: old_a=2
-        new_a=max(1,min(3,old_a))
-        if old_a != new_a:
-            changes.append({"task_id":t.get("id"),"field":"max_attempts","from":old_a,"to":new_a})
-        t["max_attempts"]=new_a
-    if changes and rid:
-        event(rid,"PLAN_RUNTIME_NORMALIZED","planner runtime controls normalized",{"changes":changes})
-        print(f"PLAN_RUNTIME_NORMALIZED run={rid} changes={len(changes)}",flush=True)
     return p,changes
 
 def valid_plan(p,budget):
@@ -809,38 +762,18 @@ def task_run(rid,tid):
                     if not source_urls:
                         event(rid,"RESEARCH_NO_SOURCE_METADATA","web research returned no parseable source metadata; worker must label evidence as insufficient",{},tid)
                     transform_prompt=base+f"\nWEB RESEARCH MEMO:\n{clip(web_call['text'],MAX_WEB_MEMO_CHARS)}\nSOURCE URLS AVAILABLE:\n{jd(source_urls[:MAX_EVIDENCE_ITEMS])}\nConvert this into the required worker JSON. Use only source URLs from the available list; if none are available, set insufficient_evidence and do not invent citations."
-                    worker_tokens=WORKER_INITIAL_TOKENS if n==1 else WORKER_ESCALATED_TOKENS
-                    transform_prompt2=transform_prompt if n==1 else ("Convert the existing research memo into the required worker JSON. Be concise and complete; do not add prose outside the JSON schema.\n"+transform_prompt)
-                    o=call(rid,tid,"task_structuring" if n==1 else "task_structuring_escalated",transform_prompt2,WORKER_MODEL,False,("worker_output",WORKER),worker_tokens,float(t["budget_limit"])*.45,timeout_override=task_timeout)
+                    o=call(rid,tid,"task_structuring",transform_prompt,MODEL,False,("worker_output",WORKER),1200,float(t["budget_limit"])*.45,timeout_override=task_timeout)
                 else:
-                    worker_tokens=2200 if n==1 else 3200
-                    o=call(rid,tid,"task" if n==1 else "task_escalated",base+"\nReturn only the worker JSON schema.",WORKER_MODEL,False,("worker_output",WORKER),worker_tokens,float(t["budget_limit"]),timeout_override=task_timeout)
+                    o=call(rid,tid,"task",base+"\nReturn only the worker JSON schema.",MODEL,False,("worker_output",WORKER),2600,float(t["budget_limit"]),timeout_override=task_timeout)
                 d=parse_json(o["text"])
                 d=update_claim_evidence(rid,tid,d)
                 claims=d.get("claims",[])
                 evidence_ids=sorted(set(sum([c.get("evidence_ids",[]) for c in claims],[])))
-                contract=jl(t["contract"])
-                evidence_required=bool(contract.get("evidence_required"))
-                completion_mode=str(contract.get("completion_mode") or "").lower()
-                synthesis_modes={"artifact","synthesis","planning","decision","report","deliverable"}
-                upstream_evidence=[]
-                if not evidence_ids and int(t["requires_web"]) and evidence_required:
-                    # Synthesis/planning tasks are allowed to inherit the evidence
-                    # gathered by their upstream tasks. They should not fail merely
-                    # because the synthesis model did not emit duplicate citations.
-                    if completion_mode in synthesis_modes or q("SELECT 1 FROM deps WHERE run_id=? AND downstream=? LIMIT 1",(rid,tid),one=True):
-                        upstream_evidence=q("SELECT DISTINCT id FROM evidence WHERE run_id=? AND task_id IN (SELECT upstream FROM deps WHERE run_id=? AND downstream=?) ORDER BY retrieved_at DESC LIMIT ?",(rid,rid,tid,MAX_EVIDENCE_ITEMS))
-                    if upstream_evidence:
-                        evidence_ids=sorted(set(evidence_ids+[e["id"] for e in upstream_evidence]))
-                        d["inherited_evidence_ids"]=[e["id"] for e in upstream_evidence]
-                        event(rid,"EVIDENCE_INHERITED",t["title"],{"count":len(upstream_evidence),"completion_mode":completion_mode},tid)
-                    elif not d.get("insufficient_evidence"):
-                        raise RuntimeError("strategy_error:web task produced no usable evidence")
+                if int(t["requires_web"]) and jl(t["contract"]).get("evidence_required") and not evidence_ids:
+                    if not d.get("insufficient_evidence"):
+                        raise RuntimeError("strategy_error:web task produced no evidence-linked claims")
                 supported=sum(bool(c.get("evidence_ids")) for c in claims)
-                if upstream_evidence and not supported:
-                    conf=max(.55,min(1,.55+.45*(1-min(.8,.04*len(d.get("unknowns",[]))))))
-                else:
-                    conf=max(.1,min(1,.6*supported/max(1,len(claims))+.4*(1-min(.8,.04*len(d.get("unknowns",[]))))))
+                conf=max(.1,min(1,.6*supported/max(1,len(claims))+.4*(1-min(.8,.04*len(d.get("unknowns",[]))))))
                 artifact_id=None
                 if d.get("artifact"):
                     artifact_id=art(rid,tid,d["artifact"]["name"],d["artifact"]["content"],d["artifact"]["type"])
@@ -895,14 +828,14 @@ def schedule(rid):
         launched=0
         terminal={"completed","failed","blocked","waiting_approval","cancelled","interrupted"}
         for t in ts:
-            if t["status"] not in {"pending","waiting_dependency","ready"}: continue
+            if t["status"] not in {"pending","waiting_dependency","ready","retrying"}: continue
             state,ds=dependency_state(rid,t["id"])
             if state=="blocked":
-                changed=x("UPDATE tasks SET status='blocked',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready')",("required dependency did not complete",now(),t["id"]))
+                changed=x("UPDATE tasks SET status='blocked',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready','retrying')",("required dependency did not complete",now(),t["id"]))
                 if changed is not None: event(rid,"TASK_BLOCKED","required dependency did not complete",{"dependencies":[dict(d) for d in ds]},t["id"])
                 continue
             if state=="waiting":
-                x("UPDATE tasks SET status='waiting_dependency',updated_at=? WHERE id=? AND status IN ('pending','ready')",(now(),t["id"]))
+                x("UPDATE tasks SET status='waiting_dependency',updated_at=? WHERE id=? AND status IN ('pending','ready','retrying')",(now(),t["id"]))
                 continue
             x("UPDATE tasks SET status='ready',updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','retrying')",(now(),t["id"]))
             with lock:
@@ -930,14 +863,14 @@ def schedule(rid):
         # Reconcile once more before declaring a stall. This catches a completion
         # written immediately after the first snapshot.
         progressed=False
-        for t in q("SELECT * FROM tasks WHERE run_id=? AND status IN ('pending','waiting_dependency','ready')",(rid,)):
+        for t in q("SELECT * FROM tasks WHERE run_id=? AND status IN ('pending','waiting_dependency','ready','retrying')",(rid,)):
             state,_=dependency_state(rid,t["id"])
             if state in {"ready","blocked"}: progressed=True; break
         if not launched and not progressed:
-            unresolved=[t["id"] for t in q("SELECT id FROM tasks WHERE run_id=? AND status IN ('pending','waiting_dependency','ready')",(rid,))]
+            unresolved=[t["id"] for t in q("SELECT id FROM tasks WHERE run_id=? AND status IN ('pending','waiting_dependency','ready','retrying')",(rid,))]
             event(rid,"SCHEDULER_STALLED","no runnable task and no active worker remains",{"unresolved_tasks":unresolved})
             for tid2 in unresolved:
-                x("UPDATE tasks SET status='failed',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready')",("scheduler stalled: unresolved dependency state",now(),tid2))
+                x("UPDATE tasks SET status='failed',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready','retrying')",("scheduler stalled: unresolved dependency state",now(),tid2))
             return
         time.sleep(SCHEDULER_POLL_SECONDS)
     event(rid,"RUN_DEADLINE_EXCEEDED","run deadline exceeded",{"run_timeout_seconds":RUN_TIMEOUT})
@@ -948,20 +881,44 @@ def schedule(rid):
     release_all_task_reservations(rid,None)
 
 def evaluate(rid,stage):
-    g=get_goal_from_run(rid); ts=q("SELECT * FROM tasks WHERE run_id=?",(rid,))
-    task_view=[{"id":t["plan_id"],"status":t["status"],"output":clip(t["output"],3000),"structured":clip(jd(jl(t["structured"])),4500)} for t in ts]
+    g=get_goal_from_run(rid); ts=q("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at")
+    task_view=[{"id":t["plan_id"],"title":t["title"],"status":t["status"],"required":bool(t["required"]),"output":clip(t["output"],3000),"structured":clip(jd(jl(t["structured"])),4500),"confidence":t["confidence"]} for t in ts]
     ev_view=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"confidence":e["confidence"]} for e in q("SELECT id,title,url,publisher,confidence FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]
-    prompt=f"""Independently evaluate the objective.\nOBJECTIVE: {clip(g['title'],500)} / {clip(g['description'],4000)}\nCRITERIA: {clip(g['criteria'],5000)}\nTASKS: {jd(task_view)}\nEVIDENCE: {jd(ev_view)}\nDo not pass if required work failed or blocked, evidence is insufficient, contradictions are material, or criteria are missing. Return evaluator JSON."""
+    prompt=f"""You are the independent verification layer for an AI workforce.
+Evaluate whether the WORKFORCE'S DELIVERED WORK actually satisfies the stated objective and success criteria.
+Do not equate a task marked completed with the real-world action having occurred. Agents cannot claim that customer interviews, paid campaigns, purchases, deployments, outreach, experiments, or other external side effects happened unless the system has an explicit tool/result proving that action. When such work is requested but cannot actually be performed, require a validation PLAN or clearly label it as pending rather than treating it as completed evidence.
+Do not reject a planning objective merely because future validation is still needed: distinguish a requested strategy/plan from an external execution task.
+For factual claims, require evidence when the claim depends on current external facts. Do not require web evidence for clearly labeled assumptions, recommendations, calculations derived from supplied numbers, or proposed experiments.
+Treat material contradictions and unsupported claims as verification gaps.
+For every success criterion, return one criterion_results entry with pass/partial/fail and explain why.
+Create targeted replan_tasks ONLY for concrete gaps. Choose action_type evidence_research when current external evidence is missing, analysis when synthesis/calculation is missing, and validation_plan when the original plan incorrectly implied that an external action had already happened.
+A validation_plan task must NOT claim to have run the interview/experiment/campaign; it must specify how the user would validate it, sample/inputs, metrics, decision thresholds, and next action.
+OBJECTIVE: {clip(g['title'],500)}
+DESCRIPTION: {clip(g['description'],4000)}
+SUCCESS CRITERIA: {clip(g['criteria'],5000)}
+TASKS: {jd(task_view)}
+EVIDENCE: {jd(ev_view)}
+Return only the evaluator JSON schema. Pass only when the required criteria are substantively satisfied, required tasks are completed, evidence is adequate for claims that need it, and no material unsupported real-world action is presented as completed."""
     try:
-        o=call(rid,None,"evaluator",prompt,MODEL,False,("evaluation",EVAL),2600,min(1.0,max(.05,g["budget"]*.12)))
+        o=call(rid,None,"evaluator",prompt,MODEL,False,("evaluation",EVAL),3000,min(1.0,max(.05,g["budget"]*.14)))
         d=parse_json(o["text"])
-        passed=bool(d.get("passed")) and float(d.get("score",0))>=.8 and not any(t["required"] and t["status"]!="completed" for t in ts)
+        criteria=d.get("criterion_results") or []
+        hard_fail=[c for c in criteria if c.get("status")=="fail"]
+        partial=[c for c in criteria if c.get("status")=="partial"]
+        required_failed=[t for t in ts if t["required"] and t["status"]!="completed"]
+        model_pass=bool(d.get("passed"))
+        score=float(d.get("score",0))
+        # The evaluator must explicitly support the pass. A high numeric score alone is never enough.
+        passed=model_pass and score>=.8 and not hard_fail and not required_failed
         d["passed"]=passed
-        x("INSERT INTO evaluations(id,run_id,stage,score,passed,dimensions,failures,recommendations,contradictions,model,cost,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(uid("eval"),rid,stage,float(d.get("score",0)),int(passed),jd(d.get("dimensions",{})),jd(d.get("failed_checks",[])),jd(d.get("recommendations",[])),jd(d.get("contradictions",[])),MODEL,o["cost"],now()))
+        d["verification_summary"]={"criteria_total":len(criteria),"criteria_failed":len(hard_fail),"criteria_partial":len(partial),"required_tasks_incomplete":len(required_failed)}
+        x("INSERT INTO evaluations(id,run_id,stage,score,passed,dimensions,failures,recommendations,contradictions,model,cost,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(uid("eval"),rid,stage,score,int(passed),jd(d.get("dimensions",{})),jd({"failed_checks":d.get("failed_checks",[]),"criterion_results":criteria}),jd(d.get("recommendations",[])),jd(d.get("contradictions",[])),MODEL,o["cost"],now()))
         for c in d.get("contradictions",[]):
             x("INSERT INTO memory(id,company_id,goal_id,task_id,type,key,value,evidence_ids,confidence,freshness_days,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(uid("mem"),g["company_id"],g["id"],None,"contradiction","finding",jd(c),"[]",.3,None,now(),now()))
+        event(rid,"VERIFICATION_COMPLETED",f"verification stage {stage} completed",{"passed":passed,"score":score,"criteria_total":len(criteria),"criteria_failed":len(hard_fail),"criteria_partial":len(partial),"replan_tasks":len(d.get("replan_tasks",[]))})
         return {"ok":True,"passed":passed,"data":d}
     except Exception as e:
+        event(rid,"VERIFICATION_FAILED","verification model or parsing failed",{"error_type":classify(e),"error":str(e)})
         return {"ok":False,"error":str(e)}
 
 def replans(rid,items):
@@ -978,23 +935,30 @@ def replans(rid,items):
     available=max(0.0,float(g["budget"])-spent-reserved)
     selected=list(items[:4])
     if available < 0.05:
-        event(rid,"REPLAN_SKIPPED","insufficient remaining budget for targeted recovery",{"available_budget":available})
-        return 0
+        event(rid,"REPLAN_SKIPPED","insufficient remaining budget for targeted recovery",{"available_budget":available});return 0
     per=min(0.20,available/max(1,len(selected)))
     count=max(1,min(len(selected),int(available//max(0.01,min(0.05,per))) if per>0 else 0))
-    selected=selected[:count]
-    per=available/max(1,len(selected))
-    n=0
+    selected=selected[:count];per=available/max(1,len(selected));n=0
     for i,it in enumerate(selected):
-        ins=uid("ins")
-        x("INSERT INTO instances(id,goal_id,agent_id,name,instructions,status,spend,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(ins,g["id"],ag["id"],ag["name"],str(it),"active",0,now(),now()))
+        ins=uid("ins"); action=str(it.get("action_type") or "analysis"); requires_web=int(bool(it.get("requires_web")))
+        title=str(it.get("title") or "Targeted verification")
+        reason=str(it.get("reason") or "Resolve evaluator gap")
+        if action=="validation_plan":
+            instructions=(f"Create a concrete validation plan for this unresolved gap: {reason}. "
+                          "Do NOT claim the external interview, campaign, experiment, outreach, purchase, or deployment actually occurred. "
+                          "Specify target participants/inputs, sample size or scope, procedure, metrics, decision thresholds, risks, and exact next action.")
+        elif action=="evidence_research":
+            instructions=f"Resolve this evidence gap with focused current research: {reason}. Cite only sources actually returned by web search and label uncertainty."
+        else:
+            instructions=f"Resolve this analytical gap: {reason}. Show assumptions, calculations or logic and identify remaining uncertainty."
+        x("INSERT INTO instances(id,goal_id,agent_id,name,instructions,status,spend,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(ins,g["id"],ag["id"],ag["name"],instructions,"active",0,now(),now()))
         tid=uid("task")
-        ct={"inputs":["objective","evaluator_gap"],"outputs":["resolution"],"success_conditions":["gap resolved"],"failure_conditions":["insufficient evidence"],"evidence_required":True,"allowed_tools":["web_search"],"time_limit_seconds":120,"retry_policy":"strategy_change","completion_mode":"structured"}
-        x("INSERT INTO tasks(id,run_id,plan_id,instance_id,title,instructions,contract,status,output,structured,confidence,budget_limit,spent,attempts,max_attempts,required,requires_web,error_type,error_message,checkpoint,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(tid,rid,"R"+str(i+1),ins,it.get("title","Targeted verification"),it.get("reason","Resolve evaluator gap"),jd(ct),"pending",None,None,None,max(0.05,min(0.20,per)),0,0,2,1,1,None,None,None,now(),now()))
+        ct={"inputs":["objective","evaluator_gap"],"outputs":["resolution"],"success_conditions":["gap resolved"],"failure_conditions":["insufficient evidence"],"evidence_required":bool(requires_web),"allowed_tools":["web_search"] if requires_web else [],"time_limit_seconds":120,"retry_policy":"strategy_change","completion_mode":"structured"}
+        x("INSERT INTO tasks(id,run_id,plan_id,instance_id,title,instructions,contract,status,output,structured,confidence,budget_limit,spent,attempts,max_attempts,required,requires_web,error_type,error_message,checkpoint,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(tid,rid,"R"+str(i+1),ins,title,instructions,jd(ct),"pending",None,None,None,max(0.05,min(0.20,per)),0,0,2,1,requires_web,None,None,None,now(),now()))
         n+=1
     if n:
         x("UPDATE goals SET replan_count=replan_count+1,status='replanning',updated_at=? WHERE id=?",(now(),g["id"]))
-        event(rid,"REPLAN_CREATED","targeted recovery tasks created",{"count":n,"budget_each":round(per,4)})
+        event(rid,"REPLAN_CREATED","targeted recovery tasks created",{"count":n,"budget_each":round(per,4),"tasks":[{"title":str(it.get("title")),"action_type":str(it.get("action_type") or "analysis"),"requires_web":bool(it.get("requires_web"))} for it in selected]})
     return n
 
 def report_call(rid, prompt, spend_cap):
@@ -1040,19 +1004,18 @@ Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exa
             plan=parse_json(p["text"])
             plan,role_changes=repair_plan(plan,rid)
             plan,budget_changes=normalize_plan_budgets(plan,float(g["budget"]),rid)
-            plan,runtime_changes=normalize_plan_contracts(plan,rid)
             valid_plan(plan,float(g["budget"]))
             degraded=0
-            if role_changes or budget_changes or runtime_changes:
+            if role_changes or budget_changes:
                 event(rid,"PLANNER_VALIDATED_AFTER_REPAIR","planner output repaired and validated; no fallback used",
-                      {"role_changes":len(role_changes),"budget_changes":len(budget_changes),"runtime_changes":len(runtime_changes)})
+                      {"role_changes":len(role_changes),"budget_changes":len(budget_changes)})
                 print(f"PLANNER_VALIDATED_AFTER_REPAIR run={rid} role_changes={len(role_changes)} budget_changes={len(budget_changes)}",flush=True)
-            event(rid,"PLANNER_COMPLETED","CEO planner produced a valid structured plan",{"agents":len(plan["agents"]),"tasks":len(plan["tasks"]),"repaired":bool(role_changes or budget_changes or runtime_changes)})
+            event(rid,"PLANNER_COMPLETED","CEO planner produced a valid structured plan",{"agents":len(plan["agents"]),"tasks":len(plan["tasks"]),"repaired":bool(role_changes or budget_changes)})
             print(f"PLANNER_COMPLETED run={rid} agents={len(plan['agents'])} tasks={len(plan['tasks'])} repaired={bool(role_changes or budget_changes)}",flush=True)
         except Exception as e:
             event(rid,"PLANNER_FALLBACK","planner output could not be safely repaired/validated; deterministic fallback used",{"error_type":classify(e),"error":str(e)})
             print(f"PLANNER_FALLBACK run={rid} error_type={classify(e)} error={e}",flush=True)
-            plan=fallback(g);plan,_=normalize_plan_budgets(plan,float(g["budget"]),rid);plan,_=normalize_plan_contracts(plan,rid);valid_plan(plan,float(g["budget"]));degraded=1;event(rid,"PLANNER_DEGRADED","safe fallback planner used",{"error":str(e)})
+            plan=fallback(g);plan,_=normalize_plan_budgets(plan,float(g["budget"]),rid);valid_plan(plan,float(g["budget"]));degraded=1;event(rid,"PLANNER_DEGRADED","safe fallback planner used",{"error":str(e)})
         x("UPDATE goals SET plan=?,planner_degraded=?,updated_at=? WHERE id=?",(jd(plan),degraded,now(),g["id"]))
         roles={}
         for a in plan["agents"]:
@@ -1161,7 +1124,7 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"verification_engine":"criterion_level_revision_v1","version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
 def dg(request:Request):
@@ -1184,6 +1147,13 @@ def ddb(request:Request):
     auth(request)
     c=db();tables=[r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()];cols={t:table_columns(c,t) for t in tables};compatible=schema_ok(c) if 'goals' in cols else False;c.close()
     return {"status":"ok","version":APP_VERSION,"schema_version":SCHEMA_VERSION,"db":DB,"tables":tables,"goals_columns":cols.get("goals",[]),"tasks_columns":cols.get("tasks",[]),"reservations_columns":cols.get("reservations",[]),"schema_compatible":compatible}
+
+@app.get("/diagnostics/verification/{rid}")
+def dverify(rid,request:Request):
+    auth(request)
+    g=get_goal_from_run(rid)
+    ev=q("SELECT * FROM evaluations WHERE run_id=? ORDER BY created_at DESC LIMIT 5",(rid,))
+    return {"status":"ok","version":APP_VERSION,"goal":{"id":g["id"],"status":g["status"],"verification_status":g["verification_status"]},"evaluations":[dict(e) for e in ev],"events":[dict(e) for e in q("SELECT kind,message,payload,created_at FROM events WHERE run_id=? AND kind LIKE 'VERIFICATION%' ORDER BY created_at DESC LIMIT 20",(rid,))]}
 
 @app.get("/diagnostics/run/{rid}")
 def drun(rid,request:Request):
@@ -1226,6 +1196,8 @@ async function refresh(){
  let plannerLabel=g.planner_degraded?'DEGRADED FALLBACK':(pe&&pe.kind==='PLANNER_VALIDATED_AFTER_REPAIR'?'VALIDATED + REPAIRED':'VALIDATED');
  let h='<div class="card"><b>Status:</b> '+E(g.status)+' | <b>Spend:</b> $'+Number(g.spent||0).toFixed(4)+' / $'+Number(g.budget||0).toFixed(2)+' | <b>Verification:</b> '+E(g.verification_status||'-')+'<br>Planner: '+E(plannerLabel)+'</div>';
  h+='<div class="card"><h2>Task graph</h2>'+(d.tasks.map(t=>'<div class="task"><b>'+E(t.title)+'</b> <span class="badge">'+E(t.status)+'</span><div class="muted">id '+E(t.plan_id||'')+' | attempts '+Number(t.attempts||0)+' | spend $'+Number(t.spent||0).toFixed(4)+' | confidence '+E(t.confidence??'-')+'</div>'+(t.error_message?'<div class="error"><b>'+E((t.error_type==='transient'?'Temporary execution issue':t.error_type==='strategy'?'Strategy adjustment required':t.error_type==='budget'?'Budget limit reached':t.error_type==='logical'?'Task dependency or logic issue':'Task failed'))+'</b><div>'+E(t.error_message)+'</div></div>':'')+'</div>').join('')||'No tasks created.')+'</div>';
+ const latest=(d.evaluations||[])[0];
+ if(latest){let fails=[]; try{fails=JSON.parse(latest.failures||'{}').criterion_results||[]}catch(_){}; h+='<div class="card"><h2>Verification details</h2><div class="muted">stage '+E(latest.stage||'')+' | score '+Number(latest.score||0).toFixed(2)+' | '+(latest.passed?'passed':'failed')+'</div>'; if(fails.length){h+='<div class="task"><b>Criterion review</b>'+fails.map(c=>'<div style="margin-top:8px"><b>'+E(c.status||'')+'</b> â '+E(c.criterion||'')+'<div class="muted">'+E(c.reason||'')+'</div>'+(c.evidence_needed?'<div class="muted">Evidence/action: '+E(c.evidence_needed)+'</div>':'')+'</div>').join('')+'</div>';} h+='</div>';}
  h+='<div class="card"><h2>Evidence</h2>'+(d.evidence.map(e=>{const u=U(e.url);let host='';try{host=u?new URL(u).hostname.replace('www.',''):''}catch(_){host=''}return '<div class="task"><b>'+E(e.title||'Source')+'</b>'+(e.publisher?'<div class="muted">'+E(e.publisher)+'</div>':'')+(u?'<div class="muted">'+E(host)+'</div><a target="_blank" rel="noopener noreferrer" href="'+E(u)+'">Open source</a>':'')+'</div>'}).join('')||'No evidence yet.')+'</div>';
  if(g.final_output)h+='<div class="card"><h2>Final output</h2><pre>'+E(g.final_output)+'</pre></div>';
  if(['queued','planning','executing','evaluating','replanning'].includes(g.status))h+='<form method="post" action="/goals/%s/cancel"><button>Cancel run</button></form>'; if(['failed','incomplete','interrupted'].includes(g.status))h+='<form method="post" action="/goals/%s/retry"><button>Retry</button></form>';
@@ -1237,7 +1209,7 @@ async function refresh(){
 @app.get("/api/goals/{gid}")
 def api(gid,request:Request):
     auth(request);g=gro(gid);rid=g["run_id"];ts=q("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at",(rid,)) if rid else []
-    return {"goal":dict(g)|{"app_version":APP_VERSION,"schema_version":SCHEMA_VERSION},"tasks":[dict(t)|{"contract":jl(t["contract"]),"structured":jl(t["structured"])} for t in ts],"evidence":[dict(e) for e in q("SELECT * FROM evidence WHERE run_id=?",(rid,))] if rid else [],"evaluations":[dict(e) for e in q("SELECT * FROM evaluations WHERE run_id=?",(rid,))] if rid else [],"handoffs":[dict(h) for h in q("SELECT * FROM handoffs WHERE run_id=?",(rid,))] if rid else [],"events":[dict(e) for e in q("SELECT * FROM events WHERE run_id=? ORDER BY created_at DESC LIMIT 100",(rid,))] if rid else []}
+    return {"goal":dict(g)|{"app_version":APP_VERSION,"schema_version":SCHEMA_VERSION},"tasks":[dict(t)|{"contract":jl(t["contract"]),"structured":jl(t["structured"])} for t in ts],"evidence":[dict(e) for e in q("SELECT * FROM evidence WHERE run_id=?",(rid,))] if rid else [],"evaluations":[dict(e) for e in q("SELECT * FROM evaluations WHERE run_id=? ORDER BY created_at DESC",(rid,))] if rid else [],"handoffs":[dict(h) for h in q("SELECT * FROM handoffs WHERE run_id=?",(rid,))] if rid else [],"events":[dict(e) for e in q("SELECT * FROM events WHERE run_id=? ORDER BY created_at DESC LIMIT 100",(rid,))] if rid else []}
 
 @app.post("/goals/{gid}/retry")
 def retry(gid,request:Request):
