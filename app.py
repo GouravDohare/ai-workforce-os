@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.12"
+APP_VERSION = "0.4.14"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -111,21 +111,40 @@ def esc(s):
             .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;"))
 
 def canonical_condition(value):
-    v = re.sub(r"[^a-z]", "", str(value or "").lower())
+    """Map planner prose conditions to the small runtime condition vocabulary.
+
+    The planner may express the same dependency in natural language, e.g.
+    ``T1 outputs accepted by CEO`` or ``after T1 is reviewed``. The dependency
+    edge already identifies the upstream task, so positive completion/acceptance
+    language is semantically equivalent to ``completed``. Negative language is
+    deliberately rejected rather than silently inverted.
+    """
+    raw = str(value or "").strip().lower()
+    v = re.sub(r"[^a-z0-9]", "", raw)
     aliases = {
         "completed":"completed", "complete":"completed", "done":"completed",
         "success":"completed", "successful":"completed", "succeeded":"completed",
         "provided":"completed", "outputprovided":"completed", "outputsprovided":"completed",
         "available":"completed", "outputsavailable":"completed", "resultprovided":"completed",
-        "finished":"completed", "ready":"completed",
+        "finished":"completed", "ready":"completed", "produced":"completed",
+        "generated":"completed", "delivered":"completed", "received":"completed",
+        "accepted":"completed", "approved":"completed", "validated":"completed",
+        "reviewed":"completed", "verified":"completed", "checked":"completed",
+        "submitted":"completed", "handedoff":"completed", "handoff":"completed",
         "optional":"optional", "optionally":"optional"
     }
     if v in aliases:
         return aliases[v]
-    # Planners sometimes encode the dependency itself in prose, e.g.
-    # "T1 outputs provided". The DAG already stores the upstream task ID, so
-    # the runtime condition is simply that the upstream task completed.
-    if re.search(r"(?:provided|available|ready|complete|completed|finished|done|successful|succeeded)$", v):
+    if any(x in v for x in ("notcomplete", "notcompleted", "failed", "rejected", "unavailable", "missing")):
+        return None
+    # Positive state phrases embedded in planner prose.
+    positive = (
+        "provided", "available", "ready", "complete", "completed", "finished",
+        "done", "successful", "succeeded", "produced", "generated", "delivered",
+        "received", "accepted", "approved", "validated", "reviewed", "verified",
+        "checked", "submitted", "handedoff", "handoff"
+    )
+    if any(word in v for word in positive):
         return "completed"
     return None
 
@@ -800,11 +819,28 @@ def task_run(rid,tid):
                 d=update_claim_evidence(rid,tid,d)
                 claims=d.get("claims",[])
                 evidence_ids=sorted(set(sum([c.get("evidence_ids",[]) for c in claims],[])))
-                if int(t["requires_web"]) and jl(t["contract"]).get("evidence_required") and not evidence_ids:
-                    if not d.get("insufficient_evidence"):
-                        raise RuntimeError("strategy_error:web task produced no evidence-linked claims")
+                contract=jl(t["contract"])
+                evidence_required=bool(contract.get("evidence_required"))
+                completion_mode=str(contract.get("completion_mode") or "").lower()
+                synthesis_modes={"artifact","synthesis","planning","decision","report","deliverable"}
+                upstream_evidence=[]
+                if not evidence_ids and int(t["requires_web"]) and evidence_required:
+                    # Synthesis/planning tasks are allowed to inherit the evidence
+                    # gathered by their upstream tasks. They should not fail merely
+                    # because the synthesis model did not emit duplicate citations.
+                    if completion_mode in synthesis_modes or q("SELECT 1 FROM deps WHERE run_id=? AND downstream=? LIMIT 1",(rid,tid),one=True):
+                        upstream_evidence=q("SELECT DISTINCT id FROM evidence WHERE run_id=? AND task_id IN (SELECT upstream FROM deps WHERE run_id=? AND downstream=?) ORDER BY retrieved_at DESC LIMIT ?",(rid,rid,tid,MAX_EVIDENCE_ITEMS))
+                    if upstream_evidence:
+                        evidence_ids=sorted(set(evidence_ids+[e["id"] for e in upstream_evidence]))
+                        d["inherited_evidence_ids"]=[e["id"] for e in upstream_evidence]
+                        event(rid,"EVIDENCE_INHERITED",t["title"],{"count":len(upstream_evidence),"completion_mode":completion_mode},tid)
+                    elif not d.get("insufficient_evidence"):
+                        raise RuntimeError("strategy_error:web task produced no usable evidence")
                 supported=sum(bool(c.get("evidence_ids")) for c in claims)
-                conf=max(.1,min(1,.6*supported/max(1,len(claims))+.4*(1-min(.8,.04*len(d.get("unknowns",[]))))))
+                if upstream_evidence and not supported:
+                    conf=max(.55,min(1,.55+.45*(1-min(.8,.04*len(d.get("unknowns",[]))))))
+                else:
+                    conf=max(.1,min(1,.6*supported/max(1,len(claims))+.4*(1-min(.8,.04*len(d.get("unknowns",[]))))))
                 artifact_id=None
                 if d.get("artifact"):
                     artifact_id=art(rid,tid,d["artifact"]["name"],d["artifact"]["content"],d["artifact"]["type"])
