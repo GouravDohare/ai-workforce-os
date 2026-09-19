@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.8"
+APP_VERSION = "0.4.9"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -305,7 +305,7 @@ PLAN={"type":"object","additionalProperties":False,"properties":{
         "name":{"type":"string"},"role":{"type":"string"},"instructions":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"skills":{"type":"array","items":{"type":"string"}},"model_policy":{"type":"object","additionalProperties":False,"properties":{"model":{"type":"string"}},"required":["model"]}
     },"required":["name","role","instructions","capabilities","skills","model_policy"]}},
     "tasks":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-        "id":{"type":"string"},"title":{"type":"string"},"agent_role":{"type":"string"},"instructions":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}},"dependency_conditions":{"type":"array","items":{"type":"string"}},"required":{"type":"boolean"},"requires_web":{"type":"boolean"},"budget_limit":{"type":"number"},"max_attempts":{"type":"integer"},"contract":{"type":"object","additionalProperties":False,"properties":{
+        "id":{"type":"string"},"title":{"type":"string"},"agent_role":{"type":"string"},"instructions":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}},"dependency_conditions":{"type":"array","items":{"type":"string"}},"required":{"type":"boolean"},"requires_web":{"type":"boolean"},"budget_limit":{"type":"number","minimum":0.01},"max_attempts":{"type":"integer"},"contract":{"type":"object","additionalProperties":False,"properties":{
             "inputs":{"type":"array","items":{"type":"string"}},"outputs":{"type":"array","items":{"type":"string"}},"success_conditions":{"type":"array","items":{"type":"string"}},"failure_conditions":{"type":"array","items":{"type":"string"}},"evidence_required":{"type":"boolean"},"allowed_tools":{"type":"array","items":{"type":"string"}},"time_limit_seconds":{"type":"integer"},"retry_policy":{"type":"string"},"completion_mode":{"type":"string"}
         },"required":["inputs","outputs","success_conditions","failure_conditions","evidence_required","allowed_tools","time_limit_seconds","retry_policy","completion_mode"]}
     },"required":["id","title","agent_role","instructions","depends_on","dependency_conditions","required","requires_web","budget_limit","max_attempts","contract"]}},
@@ -383,6 +383,67 @@ def repair_plan(p, rid=None):
         print(f"PLAN_REPAIRED run={rid} changes={changes}",flush=True)
     return p, changes
 
+def normalize_plan_budgets(p, budget, rid=None):
+    """Make task budgets deterministic and guarantee the sum fits the goal budget.
+    The planner is allowed to suggest approximate allocations, but execution must
+    never inherit a zero/negative/non-finite budget or a sum that exceeds the goal.
+    """
+    budget=float(budget)
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("invalid goal budget")
+    tasks=p.get("tasks") or []
+    if not tasks:
+        raise ValueError("invalid plan size")
+    MIN_TASK_BUDGET=max(0.01, min(0.05, budget/max(1,len(tasks)*2)))
+    raw=[]
+    for t in tasks:
+        try:
+            v=float(t.get("budget_limit", 0))
+        except Exception:
+            v=0.0
+        if not math.isfinite(v) or v <= 0:
+            v=MIN_TASK_BUDGET
+        raw.append(v)
+    # First normalize proportions, then round, then reconcile the rounding residue.
+    total=sum(raw)
+    if total <= 0:
+        raw=[1.0]*len(tasks); total=float(len(tasks))
+    if total > budget:
+        raw=[v*budget/total for v in raw]
+    # Never create a task allocation below the minimum execution reservation.
+    if budget >= MIN_TASK_BUDGET*len(tasks):
+        raw=[max(MIN_TASK_BUDGET,v) for v in raw]
+    total=sum(raw)
+    if total > budget:
+        # Reduce the largest allocations first, preserving the minimum.
+        excess=total-budget
+        for idx in sorted(range(len(raw)), key=lambda i: raw[i], reverse=True):
+            room=max(0.0, raw[idx]-MIN_TASK_BUDGET)
+            cut=min(room, excess)
+            raw[idx]-=cut; excess-=cut
+            if excess <= 1e-9: break
+        if excess > 1e-8:
+            raise ValueError("goal budget too small for task allocations")
+    vals=[round(v,4) for v in raw]
+    # Correct rounding residue exactly on the largest task.
+    residue=round(budget-sum(vals),4)
+    if abs(residue) > 0:
+        idx=max(range(len(vals)), key=lambda i: vals[i])
+        vals[idx]=round(vals[idx]+residue,4)
+    if any((not math.isfinite(v)) or v <= 0 for v in vals) or sum(vals) > budget+1e-6:
+        raise ValueError("unable to normalize task budgets")
+    changes=[]
+    for t,v in zip(tasks,vals):
+        old=t.get("budget_limit")
+        if old != v:
+            changes.append({"task_id":t.get("id"),"from":old,"to":v})
+        t["budget_limit"]=v
+    if changes and rid:
+        event(rid,"PLAN_BUDGET_NORMALIZED","task budgets normalized to the goal budget",
+              {"goal_budget":budget,"changes":changes,"total":round(sum(vals),4)})
+        print(f"PLAN_BUDGET_NORMALIZED run={rid} total={sum(vals):.4f} budget={budget:.4f} changes={len(changes)}",flush=True)
+    return p,changes
+
 def valid_plan(p,budget):
     if not p.get("agents") or not p.get("tasks") or len(p["tasks"])>16: raise ValueError("invalid plan size")
     roles={a["role"] for a in p["agents"]}; ids=set(); graph={}
@@ -391,7 +452,8 @@ def valid_plan(p,budget):
         ids.add(t["id"]); graph[t["id"]]=set(t["depends_on"])
         if len(t["depends_on"])!=len(t["dependency_conditions"]): raise ValueError("dependency mismatch")
         if not 1<=int(t["max_attempts"])<=4: raise ValueError("bad attempts")
-        if float(t["budget_limit"])<=0: raise ValueError("bad task budget")
+        v=float(t["budget_limit"])
+        if not math.isfinite(v) or v<=0: raise ValueError("bad task budget")
     for n,d in graph.items():
         if n in d or any(x not in graph for x in d): raise ValueError("bad dependency")
     visiting=set(); visited=set()
@@ -403,9 +465,7 @@ def valid_plan(p,budget):
         visiting.remove(n);visited.add(n)
     for n in graph:visit(n)
     total=sum(float(t["budget_limit"]) for t in p["tasks"])
-    if total>float(budget):
-        scale=float(budget)/total
-        for t in p["tasks"]:t["budget_limit"]=max(.05,round(float(t["budget_limit"])*scale,4))
+    if total>float(budget)+1e-6: raise ValueError("task budgets exceed goal budget")
     return p
 
 
@@ -638,13 +698,21 @@ BUDGET: ${g['budget']}
 Return ONLY the required plan JSON. Keep it compact: normally 3-6 agents and 4-8 tasks.
 Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exactly equal one of the declared agents[].role values; never invent an owner role. Explicit dependencies must reference task IDs that exist. Every task needs a machine-readable contract, realistic positive budget, and short instruction. Do not create unnecessary agents or tasks. Use web research only where current external facts are genuinely required. Separate research from synthesis and verification."""
             p=call(rid,None,"planner",planner_prompt,MODEL,False,("ceo_plan",PLAN),2800,min(1.0,g["budget"]*.18),timeout_override=PLANNER_TIMEOUT)
-            plan=parse_json(p["text"]);plan,_changes=repair_plan(plan,rid);valid_plan(plan,float(g["budget"]));degraded=0
-            event(rid,"PLANNER_COMPLETED","CEO planner produced a valid structured plan",{"agents":len(plan["agents"]),"tasks":len(plan["tasks"])})
-            print(f"PLANNER_COMPLETED run={rid} agents={len(plan['agents'])} tasks={len(plan['tasks'])}",flush=True)
+            plan=parse_json(p["text"])
+            plan,role_changes=repair_plan(plan,rid)
+            plan,budget_changes=normalize_plan_budgets(plan,float(g["budget"]),rid)
+            valid_plan(plan,float(g["budget"]))
+            degraded=0
+            if role_changes or budget_changes:
+                event(rid,"PLANNER_VALIDATED_AFTER_REPAIR","planner output repaired and validated; no fallback used",
+                      {"role_changes":len(role_changes),"budget_changes":len(budget_changes)})
+                print(f"PLANNER_VALIDATED_AFTER_REPAIR run={rid} role_changes={len(role_changes)} budget_changes={len(budget_changes)}",flush=True)
+            event(rid,"PLANNER_COMPLETED","CEO planner produced a valid structured plan",{"agents":len(plan["agents"]),"tasks":len(plan["tasks"]),"repaired":bool(role_changes or budget_changes)})
+            print(f"PLANNER_COMPLETED run={rid} agents={len(plan['agents'])} tasks={len(plan['tasks'])} repaired={bool(role_changes or budget_changes)}",flush=True)
         except Exception as e:
-            event(rid,"PLANNER_FAILED","CEO planner failed; switching to deterministic fallback",{"error_type":classify(e),"error":str(e)})
-            print(f"PLANNER_FAILED run={rid} error_type={classify(e)} error={e}",flush=True)
-            plan=fallback(g);valid_plan(plan,float(g["budget"]));degraded=1;event(rid,"PLANNER_DEGRADED","safe fallback planner used",{"error":str(e)})
+            event(rid,"PLANNER_FALLBACK","planner output could not be safely repaired/validated; deterministic fallback used",{"error_type":classify(e),"error":str(e)})
+            print(f"PLANNER_FALLBACK run={rid} error_type={classify(e)} error={e}",flush=True)
+            plan=fallback(g);plan,_=normalize_plan_budgets(plan,float(g["budget"]),rid);valid_plan(plan,float(g["budget"]));degraded=1;event(rid,"PLANNER_DEGRADED","safe fallback planner used",{"error":str(e)})
         x("UPDATE goals SET plan=?,planner_degraded=?,updated_at=? WHERE id=?",(jd(plan),degraded,now(),g["id"]))
         roles={}
         for a in plan["agents"]:
@@ -791,7 +859,9 @@ async function refresh(){
  const rr=await fetch('/api/goals/%s',{credentials:'same-origin'});
  if(!rr.ok){document.getElementById('a').innerHTML='<div class="card error"><b>Could not load run</b><p>HTTP '+rr.status+'</p></div>';return}
  const d=await rr.json(),g=d.goal;
- let h='<div class="card"><b>Status:</b> '+E(g.status)+' Â· <b>Spend:</b> $'+Number(g.spent||0).toFixed(4)+' / $'+Number(g.budget||0).toFixed(2)+' Â· <b>Verification:</b> '+E(g.verification_status||'â')+'<br>Planner: '+(g.planner_degraded?'DEGRADED FALLBACK':'structured')+'</div>';
+ const pe=(d.events||[]).find(e=>['PLANNER_VALIDATED_AFTER_REPAIR','PLANNER_FALLBACK','PLANNER_COMPLETED'].includes(e.kind));
+ let plannerLabel=g.planner_degraded?'DEGRADED FALLBACK':(pe&&pe.kind==='PLANNER_VALIDATED_AFTER_REPAIR'?'VALIDATED + REPAIRED':'VALIDATED');
+ let h='<div class="card"><b>Status:</b> '+E(g.status)+' Â· <b>Spend:</b> $'+Number(g.spent||0).toFixed(4)+' / $'+Number(g.budget||0).toFixed(2)+' Â· <b>Verification:</b> '+E(g.verification_status||'â')+'<br>Planner: '+E(plannerLabel)+'</div>';
  h+='<div class="card"><h2>Task graph</h2>'+(d.tasks.map(t=>'<div class="task"><b>'+E(t.title)+'</b> <span class="badge">'+E(t.status)+'</span><div class="muted">attempts '+Number(t.attempts||0)+' Â· spend $'+Number(t.spent||0).toFixed(4)+' Â· confidence '+E(t.confidence??'â')+'</div>'+(t.error_message?'<div class="error">'+E(t.error_message)+'</div>':'')+'</div>').join('')||'No tasks created.')+'</div>';
  h+='<div class="card"><h2>Evidence</h2>'+(d.evidence.map(e=>{const u=U(e.url);return '<div class="task"><b>'+E(e.title||'Source')+'</b><br>'+(u?'<a target="_blank" rel="noopener noreferrer" href="'+E(u)+'">'+E(u)+'</a>':'')+'</div>'}).join('')||'No evidence yet.')+'</div>';
  if(g.final_output)h+='<div class="card"><h2>Final output</h2><pre>'+E(g.final_output)+'</pre></div>';
