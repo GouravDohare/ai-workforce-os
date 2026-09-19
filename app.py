@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.18"
+APP_VERSION = "0.4.19"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -46,6 +46,12 @@ MODEL_CALL_TIMEOUT = float(os.getenv("MODEL_CALL_TIMEOUT_SECONDS", "150"))
 RESEARCH_TIMEOUT = float(os.getenv("RESEARCH_TIMEOUT_SECONDS", "180"))
 RESEARCH_INITIAL_TOKENS = int(os.getenv("RESEARCH_INITIAL_TOKENS", "1200"))
 RESEARCH_ESCALATED_TOKENS = int(os.getenv("RESEARCH_ESCALATED_TOKENS", "1600"))
+
+# v0.4.19: explicit action semantics. The current product has research/analysis
+# tools but no external side-effect tools, so a planner must never silently
+# turn an external action into a completed task.
+ACTION_TYPES = {"research", "analysis", "validation_plan", "external_action", "approval_required"}
+SIDE_EFFECT_TOOLS = set()
 
 app = FastAPI(title="AI Workforce OS", version=APP_VERSION)
 lock = threading.RLock()
@@ -428,8 +434,8 @@ PLAN={"type":"object","additionalProperties":False,"properties":{
     },"required":["name","role","instructions","capabilities","skills","model_policy"]}},
     "tasks":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
         "id":{"type":"string"},"title":{"type":"string"},"agent_role":{"type":"string"},"instructions":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}},"dependency_conditions":{"type":"array","items":{"type":"string"}},"required":{"type":"boolean"},"requires_web":{"type":"boolean"},"budget_limit":{"type":"number","minimum":0.01},"max_attempts":{"type":"integer"},"contract":{"type":"object","additionalProperties":False,"properties":{
-            "inputs":{"type":"array","items":{"type":"string"}},"outputs":{"type":"array","items":{"type":"string"}},"success_conditions":{"type":"array","items":{"type":"string"}},"failure_conditions":{"type":"array","items":{"type":"string"}},"evidence_required":{"type":"boolean"},"allowed_tools":{"type":"array","items":{"type":"string"}},"time_limit_seconds":{"type":"integer"},"retry_policy":{"type":"string"},"completion_mode":{"type":"string"}
-        },"required":["inputs","outputs","success_conditions","failure_conditions","evidence_required","allowed_tools","time_limit_seconds","retry_policy","completion_mode"]}
+            "inputs":{"type":"array","items":{"type":"string"}},"outputs":{"type":"array","items":{"type":"string"}},"success_conditions":{"type":"array","items":{"type":"string"}},"failure_conditions":{"type":"array","items":{"type":"string"}},"evidence_required":{"type":"boolean"},"allowed_tools":{"type":"array","items":{"type":"string"}},"time_limit_seconds":{"type":"integer"},"retry_policy":{"type":"string"},"completion_mode":{"type":"string"},"action_type":{"type":"string","enum":["research","analysis","validation_plan","external_action","approval_required"]}
+        },"required":["inputs","outputs","success_conditions","failure_conditions","evidence_required","allowed_tools","time_limit_seconds","retry_policy","completion_mode","action_type"]}
     },"required":["id","title","agent_role","instructions","depends_on","dependency_conditions","required","requires_web","budget_limit","max_attempts","contract"]}},
     "verification":{"type":"object","additionalProperties":False,"properties":{"required_checks":{"type":"array","items":{"type":"string"}}},"required":["required_checks"]}
 },"required":["agents","tasks","verification"]}
@@ -518,6 +524,69 @@ def repair_plan(p, rid=None):
         print(f"PLAN_REPAIRED run={rid} changes={changes}",flush=True)
     return p, changes
 
+def infer_action_type(task):
+    """Classify the requested work from explicit planner metadata plus language.
+
+    This is deliberately conservative: verbs that can create an external side
+    effect are treated as external_action unless the planner explicitly makes
+    them a validation plan. Web search is research, not a side effect.
+    """
+    ct=task.get("contract") or {}
+    raw=str(ct.get("action_type") or "").strip().lower()
+    if raw in ACTION_TYPES:
+        return raw
+    text=" ".join([str(task.get("title") or ""),str(task.get("instructions") or ""),
+                    " ".join(str(x) for x in (ct.get("success_conditions") or []))]).lower()
+    if any(k in text for k in ("validation plan","validation procedure","how to validate","test plan","research plan")):
+        return "validation_plan"
+    if any(k in text for k in ("send email","send emails","contact prospects","contact customers","conduct interview",
+                               "customer interviews","customer discovery calls","make calls","outreach",
+                               "launch campaign","run campaign","deploy","publish","purchase","buy ",
+                               "execute experiment","run experiment","book meeting","schedule meetings",
+                               "create crm record","write to crm","send message")):
+        return "external_action"
+    if bool(task.get("requires_web")):
+        return "research"
+    return "analysis"
+
+def normalize_external_action_task(task, rid=None):
+    """Prevent unsupported real-world actions from being represented as completed.
+
+    v0.4.x has no side-effect executor. We therefore convert such tasks into a
+    truthful validation-plan deliverable. If/when a side-effect tool is present,
+    the task can remain external_action and the verification layer will require
+    tool evidence.
+    """
+    ct=task.setdefault("contract", {})
+    action=infer_action_type(task)
+    allowed=set(str(x) for x in (ct.get("allowed_tools") or []))
+    supported=bool(allowed & SIDE_EFFECT_TOOLS)
+    changes=[]
+    if action in {"external_action","approval_required"} and not supported:
+        old_title=task.get("title")
+        old_instructions=task.get("instructions")
+        task["title"] = "Validation plan: " + str(old_title) if not str(old_title).lower().startswith("validation plan:") else old_title
+        task["instructions"] = (
+            "Do NOT perform or claim the external action. Produce a concrete validation/execution plan instead. "
+            "Specify target participants or inputs, exact procedure, sample size/scope, required tools/approvals, "
+            "metrics, decision thresholds, evidence to capture, risks, and the next action. "
+            "Explicitly state that the external action was not executed by this workforce run.\n\nOriginal task: "
+            + str(old_instructions or old_title or "")
+        )
+        ct["action_type"]="validation_plan"
+        ct["completion_mode"]="plan_only"
+        ct["success_conditions"]=["validation plan produced","external action explicitly marked not executed"]
+        ct["failure_conditions"]=["external action falsely represented as executed","missing validation procedure"]
+        changes.append({"task_id":task.get("id"),"field":"action_type","from":action,"to":"validation_plan","reason":"no supported side-effect tool is available"})
+        changes.append({"task_id":task.get("id"),"field":"title","from":old_title,"to":task["title"]})
+    else:
+        if action not in ACTION_TYPES:
+            action="analysis"
+        if ct.get("action_type") != action:
+            changes.append({"task_id":task.get("id"),"field":"action_type","from":ct.get("action_type"),"to":action})
+        ct["action_type"]=action
+    return changes
+
 def normalize_plan_runtime_controls(p, rid=None):
     """Normalize planner fields that are operational controls, not business semantics.
 
@@ -530,6 +599,10 @@ def normalize_plan_runtime_controls(p, rid=None):
     changes=[]
     for t in tasks:
         tid=t.get("id")
+        ct=t.setdefault("contract", {})
+
+        # Normalize action semantics before validating runtime controls.
+        changes.extend(normalize_external_action_task(t, rid))
         ct=t.setdefault("contract", {})
 
         # Execution timeout is an operational guardrail. Prefer a useful default
@@ -675,6 +748,10 @@ def valid_plan(p,budget):
         if not 1<=int(t["max_attempts"])<=4: raise ValueError("bad attempts")
         ct=t.get("contract") or {}
         if not isinstance(ct,dict) or not isinstance(ct.get("inputs"),list) or not isinstance(ct.get("outputs"),list): raise ValueError("invalid task contract")
+        if str(ct.get("action_type") or "") not in ACTION_TYPES: raise ValueError("invalid task action type")
+        allowed=set(str(x) for x in (ct.get("allowed_tools") or []))
+        if ct.get("action_type") in {"external_action","approval_required"} and not (allowed & SIDE_EFFECT_TOOLS):
+            raise ValueError("external action has no supported side-effect tool")
         if not isinstance(ct.get("success_conditions"),list) or not isinstance(ct.get("failure_conditions"),list): raise ValueError("invalid task contract conditions")
         tl=int(ct.get("time_limit_seconds",0))
         if tl<15 or tl>900: raise ValueError("invalid task time limit")
@@ -707,10 +784,10 @@ def fallback(g):
         {"name":"Quality Reviewer","role":"qa","instructions":"Verify claims, evidence and contradictions.","capabilities":["verification"],"skills":["fact_checking"],"model_policy":{"model":MODEL}},
         {"name":"Report Writer","role":"report","instructions":"Synthesize verified work.","capabilities":["synthesis"],"skills":["reporting"],"model_policy":{"model":MODEL}}],
         "tasks":[
-            {"id":"T1","title":"Evidence collection","agent_role":"research","instructions":"Collect current evidence relevant to the objective.","depends_on":[],"dependency_conditions":[],"required":True,"requires_web":True,"budget_limit":max(.35,b*.28),"max_attempts":2,"contract":{"inputs":["objective"],"outputs":["claims","sources","unknowns"],"success_conditions":["evidence collected"],"failure_conditions":["insufficient evidence"],"evidence_required":True,"allowed_tools":["web_search"],"time_limit_seconds":120,"retry_policy":"retry_then_compact","completion_mode":"structured"}},
-            {"id":"T2","title":"Analysis","agent_role":"data","instructions":"Analyze the evidence and derive decision-relevant findings.","depends_on":["T1"],"dependency_conditions":["completed"],"required":True,"requires_web":False,"budget_limit":max(.25,b*.20),"max_attempts":2,"contract":{"inputs":["T1"],"outputs":["analysis"],"success_conditions":["analysis consistent"],"failure_conditions":["missing inputs"],"evidence_required":False,"allowed_tools":["calculator"],"time_limit_seconds":90,"retry_policy":"strategy_change","completion_mode":"structured"}},
-            {"id":"T3","title":"Verification","agent_role":"qa","instructions":"Verify the most important claims and identify contradictions.","depends_on":["T1","T2"],"dependency_conditions":["completed","completed"],"required":True,"requires_web":True,"budget_limit":max(.30,b*.22),"max_attempts":2,"contract":{"inputs":["T1","T2"],"outputs":["verification"],"success_conditions":["critical claims checked"],"failure_conditions":["unresolved material issue"],"evidence_required":True,"allowed_tools":["web_search"],"time_limit_seconds":120,"retry_policy":"strategy_change","completion_mode":"structured"}},
-            {"id":"T4","title":"Executive report","agent_role":"report","instructions":"Write a decision-ready report covering the success criteria and uncertainty.","depends_on":["T1","T2","T3"],"dependency_conditions":["completed","completed","completed"],"required":True,"requires_web":False,"budget_limit":max(.30,b*.20),"max_attempts":2,"contract":{"inputs":["T1","T2","T3"],"outputs":["final_report"],"success_conditions":["criteria addressed"],"failure_conditions":["missing criterion"],"evidence_required":True,"allowed_tools":[],"time_limit_seconds":120,"retry_policy":"strategy_change","completion_mode":"artifact"}}
+            {"id":"T1","title":"Evidence collection","agent_role":"research","instructions":"Collect current evidence relevant to the objective.","depends_on":[],"dependency_conditions":[],"required":True,"requires_web":True,"budget_limit":max(.35,b*.28),"max_attempts":2,"contract":{"inputs":["objective"],"outputs":["claims","sources","unknowns"],"success_conditions":["evidence collected"],"failure_conditions":["insufficient evidence"],"evidence_required":True,"allowed_tools":["web_search"],"time_limit_seconds":120,"retry_policy":"retry_then_compact","completion_mode":"structured","action_type":"research"}},
+            {"id":"T2","title":"Analysis","agent_role":"data","instructions":"Analyze the evidence and derive decision-relevant findings.","depends_on":["T1"],"dependency_conditions":["completed"],"required":True,"requires_web":False,"budget_limit":max(.25,b*.20),"max_attempts":2,"contract":{"inputs":["T1"],"outputs":["analysis"],"success_conditions":["analysis consistent"],"failure_conditions":["missing inputs"],"evidence_required":False,"allowed_tools":["calculator"],"time_limit_seconds":90,"retry_policy":"strategy_change","completion_mode":"structured","action_type":"analysis"}},
+            {"id":"T3","title":"Verification","agent_role":"qa","instructions":"Verify the most important claims and identify contradictions.","depends_on":["T1","T2"],"dependency_conditions":["completed","completed"],"required":True,"requires_web":True,"budget_limit":max(.30,b*.22),"max_attempts":2,"contract":{"inputs":["T1","T2"],"outputs":["verification"],"success_conditions":["critical claims checked"],"failure_conditions":["unresolved material issue"],"evidence_required":True,"allowed_tools":["web_search"],"time_limit_seconds":120,"retry_policy":"strategy_change","completion_mode":"structured","action_type":"research"}},
+            {"id":"T4","title":"Executive report","agent_role":"report","instructions":"Write a decision-ready report covering the success criteria and uncertainty.","depends_on":["T1","T2","T3"],"dependency_conditions":["completed","completed","completed"],"required":True,"requires_web":False,"budget_limit":max(.30,b*.20),"max_attempts":2,"contract":{"inputs":["T1","T2","T3"],"outputs":["final_report"],"success_conditions":["criteria addressed"],"failure_conditions":["missing criterion"],"evidence_required":True,"allowed_tools":[],"time_limit_seconds":120,"retry_policy":"strategy_change","completion_mode":"artifact","action_type":"analysis"}}
         ],"verification":{"required_checks":["criteria","evidence","contradictions","budget","unknowns"]}}
 
 def extract_sources(r):
@@ -769,7 +846,9 @@ def context(rid,t):
         deps.append({"plan_id":d["upstream"],"title":d["title"],"status":d["status"],"output":clip(d["output"],MAX_UPSTREAM_CHARS),"structured":clip(jd(jl(d["structured"])),MAX_UPSTREAM_CHARS)})
     evidence=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"claim":clip(e["claim"],500),"retrieved_at":e["retrieved_at"],"confidence":e["confidence"]} for e in ev]
     memory=[{"type":m["type"],"key":m["key"],"value":clip(m["value"],700),"confidence":m["confidence"]} for m in mem]
-    return {"objective":clip(g["title"],500),"description":clip(g["description"],4000),"criteria":clip(g["criteria"],5000),"task":{"title":clip(t["title"],500),"instructions":clip(t["instructions"],4000),"contract":jl(t["contract"])},"dependencies":deps,"evidence":evidence,"memory":memory}
+    peers=q("SELECT plan_id,title,status,output,structured FROM tasks WHERE run_id=? AND id<>? AND status='completed' ORDER BY updated_at DESC LIMIT 6",(rid,t["id"]))
+    peer_work=[{"plan_id":p["plan_id"],"title":clip(p["title"],180),"output":clip(p["output"],1400),"structured":clip(jd(jl(p["structured"])),1800)} for p in peers]
+    return {"objective":clip(g["title"],500),"description":clip(g["description"],4000),"criteria":clip(g["criteria"],5000),"task":{"title":clip(t["title"],500),"instructions":clip(t["instructions"],4000),"contract":jl(t["contract"])},"dependencies":deps,"peer_work":peer_work,"evidence":evidence,"memory":memory}
 
 def art(rid,tid,name,content,typ="text"):
     aid=uid("art"); v=q("SELECT COALESCE(MAX(version),0) v FROM artifacts WHERE run_id=? AND name=?",(rid,name),one=True)["v"]+1
@@ -835,8 +914,14 @@ def task_run(rid,tid):
                 base=(f"You are {ag['name']}. {ag['instructions']}\nOBJECTIVE: {ctx['objective']}\n"
                       f"DESCRIPTION: {ctx['description']}\nSUCCESS CRITERIA: {ctx['criteria']}\n"
                       f"TASK: {t['title']} - {t['instructions']}\nCONTRACT: {jd(ctx['task']['contract'])}\n"
-                      f"UPSTREAM TASKS: {jd(ctx['dependencies'])}\nEVIDENCE: {jd(ctx['evidence'])}\nMEMORY: {jd(ctx['memory'])}\n"
-                      "Never fabricate facts, citations, URLs or calculations.")
+                      f"UPSTREAM TASKS: {jd(ctx['dependencies'])}\nCOMPLETED PEER WORK: {jd(ctx['peer_work'])}\nEVIDENCE: {jd(ctx['evidence'])}\nMEMORY: {jd(ctx['memory'])}\n"
+                      "Never fabricate facts, citations, URLs or calculations. When peer work or evidence conflicts, do not silently choose a number; reconcile it using the strongest available source, preserve the disagreement when unresolved, and state which claim is not established. "
+                      "A task being marked completed means only that its contracted deliverable was produced; it never proves an external action occurred.")
+                action_type=str((jl(t["contract"]) or {}).get("action_type") or "analysis")
+                if action_type=="validation_plan":
+                    base += "\nACTION SAFETY: This is a validation_plan. Do not perform or claim any interview, call, outreach, campaign, deployment, purchase, or other external side effect. Return a concrete plan and explicitly say the action was not executed by this run."
+                elif action_type in {"external_action","approval_required"}:
+                    base += "\nACTION SAFETY: This task may only claim an external action occurred if an explicitly supported side-effect tool produced a verifiable result. Otherwise report not executed and provide the required approval/tool dependency."
                 if strategy=="compact": base += "\nBe concise. Return only information required by the contract."
                 source_urls=list(cached_source_urls)
                 task_timeout=max(30,min(MODEL_CALL_TIMEOUT,int(jl(t["contract"]).get("time_limit_seconds") or MODEL_CALL_TIMEOUT)))
@@ -857,6 +942,16 @@ def task_run(rid,tid):
                 else:
                     o=call(rid,tid,"task",base+"\nReturn only the worker JSON schema.",WORKER_MODEL,False,("worker_output",WORKER),WORKER_ESCALATED_TOKENS,float(t["budget_limit"]),timeout_override=task_timeout)
                 d=parse_json(o["text"])
+                action_type=str((jl(t["contract"]) or {}).get("action_type") or "analysis")
+                if action_type=="validation_plan":
+                    # Keep the record truthful even if a worker ignored the instruction.
+                    blob=json.dumps(d,ensure_ascii=False).lower()
+                    forbidden=("completed outreach","completed customer discovery","conducted 10 calls","conducted ten calls","interviews were completed","outreach was completed","campaign was launched","deployment completed")
+                    if any(x in blob for x in forbidden):
+                        d.setdefault("unknowns",[]).append("External action was not executed or independently proven by this run; worker language was normalized to pending validation.")
+                        d.setdefault("requires_validation",[]).append("Replace any unsupported execution claim with verifiable tool output or an external artifact before treating the action as completed.")
+                        d["summary"]=re.sub(r"(?i)\b(completed|conducted|launched|deployed)\b", "planned", str(d.get("summary") or ""))
+                        event(rid,"ACTION_CLAIM_GUARDED","unsupported external-action completion language detected and downgraded to validation-pending",{"action_type":action_type},tid)
                 d=update_claim_evidence(rid,tid,d)
                 claims=d.get("claims",[])
                 evidence_ids=sorted(set(sum([c.get("evidence_ids",[]) for c in claims],[])))
@@ -1001,7 +1096,13 @@ def criterion_coverage(criteria):
 
 def has_unsupported_real_world_action(criteria,task_view):
     blob=json.dumps(criteria or [],ensure_ascii=False).lower()+" "+json.dumps(task_view or [],ensure_ascii=False).lower()
-    return any(m in blob for m in ("claimed that customer interviews","claimed the campaign","claimed interviews occurred","claimed deployment","claimed outreach occurred","presented as completed"))
+    explicit=any(m in blob for m in ("claimed that customer interviews","claimed the campaign","claimed interviews occurred","claimed deployment","claimed outreach occurred","presented as completed"))
+    for t in task_view or []:
+        action=str(t.get("action_type") or "")
+        allowed=set(str(x) for x in (t.get("allowed_tools") or []))
+        if action in {"external_action","approval_required"} and not (allowed & SIDE_EFFECT_TOOLS):
+            return True
+    return explicit
 
 def normalize_verification_result(d,g,task_view):
     criteria=d.get("criterion_results") or []; mode=goal_mode(g)
@@ -1017,11 +1118,11 @@ def normalize_verification_result(d,g,task_view):
 
 def evaluate(rid,stage):
     g=get_goal_from_run(rid); ts=q("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at",(rid,))
-    task_view=[{"id":t["plan_id"],"title":t["title"],"status":t["status"],"required":bool(t["required"]),"output":clip(t["output"],3000),"structured":clip(jd(jl(t["structured"])),4500),"confidence":t["confidence"]} for t in ts]
+    task_view=[{"id":t["plan_id"],"title":t["title"],"status":t["status"],"required":bool(t["required"]),"action_type":str((jl(t["contract"]) or {}).get("action_type") or ""),"allowed_tools":list((jl(t["contract"]) or {}).get("allowed_tools") or []),"output":clip(t["output"],3000),"structured":clip(jd(jl(t["structured"])),4500),"confidence":t["confidence"]} for t in ts]
     ev_view=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"confidence":e["confidence"]} for e in q("SELECT id,title,url,publisher,confidence FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]
     prompt=f"""You are the independent verification layer for an AI workforce.
 Evaluate whether the WORKFORCE'S DELIVERED WORK actually satisfies the stated objective and success criteria.
-Do not equate a task marked completed with the real-world action having occurred. Agents cannot claim that customer interviews, paid campaigns, purchases, deployments, outreach, experiments, or other external side effects happened unless the system has an explicit tool/result proving that action. When such work is requested but cannot actually be performed, require a validation PLAN or clearly label it as pending rather than treating it as completed evidence.
+Do not equate a task marked completed with the real-world action having occurred. Inspect each task contract.action_type. A validation_plan is a deliverable about how to perform an action, not evidence that the action occurred. An external_action or approval_required task may be treated as executed only when the task output includes verifiable tool evidence/artifacts proving the side effect. Agents cannot claim that customer interviews, paid campaigns, purchases, deployments, outreach, experiments, or other external side effects happened without such proof. When unsupported execution language appears, treat it as a verification failure and require correction rather than merely recommending future validation.
 The requested deliverable mode is determined from the objective/description/criteria. For a planning/strategy deliverable, judge whether the requested decision-ready content exists; do not make empirical execution a prerequisite unless the user explicitly requested execution or validation. A planning criterion can be PASS when the strategy is substantive and clearly labels assumptions and validation needs. Use PARTIAL when important requested content is present but materially incomplete; use FAIL only when requested content is missing, contradictory, or falsely represented as completed.
 For factual claims, require evidence when the claim depends on current external facts. Do not require web evidence for clearly labeled assumptions, recommendations, calculations derived from supplied numbers, or proposed experiments.
 Treat material contradictions and unsupported claims as verification gaps.
@@ -1037,7 +1138,7 @@ Return only the evaluator JSON schema. For planning/strategy objectives, PASS me
     try:
         o=call(rid,None,"evaluator",prompt,MODEL,False,("evaluation",EVAL),3000,min(1.0,max(.05,g["budget"]*.14)))
         d=parse_json(o["text"])
-        task_view_for_policy=[{"id":t["plan_id"],"title":t["title"],"status":t["status"],"required":bool(t["required"])} for t in ts]
+        task_view_for_policy=[{"id":t["plan_id"],"title":t["title"],"status":t["status"],"required":bool(t["required"]),"action_type":str((jl(t["contract"]) or {}).get("action_type") or ""),"allowed_tools":list((jl(t["contract"]) or {}).get("allowed_tools") or [])} for t in ts]
         d=normalize_verification_result(d,g,task_view_for_policy)
         criteria=d.get("criterion_results") or []
         hard_fail=[c for c in criteria if c.get("status")=="fail"]
@@ -1130,7 +1231,7 @@ DESCRIPTION: {g['description']}
 SUCCESS CRITERIA: {g['criteria']}
 BUDGET: ${g['budget']}
 Return ONLY the required plan JSON. Keep it compact: normally 3-6 agents and 4-8 tasks.
-Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exactly equal one of the declared agents[].role values; never invent an owner role. Explicit dependencies must reference task IDs that exist. Every task needs a machine-readable contract, realistic positive budget, and short instruction. Do not create unnecessary agents or tasks. Use web research only where current external facts are genuinely required. Separate research from synthesis and verification."""
+Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exactly equal one of the declared agents[].role values; never invent an owner role. Explicit dependencies must reference task IDs that exist. Every task needs a machine-readable contract, realistic positive budget, and short instruction. Set contract.action_type to research, analysis, validation_plan, external_action, or approval_required. IMPORTANT: the current runtime has web research but no external side-effect executor. Therefore any task that would send messages, conduct interviews/calls, perform outreach, run campaigns, deploy, purchase, schedule, write to external systems, or otherwise change the outside world MUST be action_type=validation_plan unless an allowed side-effect tool is explicitly available. Never describe an external action as completed merely because a task ran. Use web research only where current external facts are genuinely required. Separate research from synthesis and verification."""
             p=call(rid,None,"planner",planner_prompt,MODEL,False,("ceo_plan",PLAN),2800,min(1.0,g["budget"]*.18),timeout_override=PLANNER_TIMEOUT)
             plan=parse_json(p["text"])
             plan,role_changes=repair_plan(plan,rid)
@@ -1263,7 +1364,7 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"planner_runtime_normalization":True,"verification_engine":"criterion_level_revision_v1","version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"planner_runtime_normalization":True,"verification_engine":"criterion_level_revision_v2_action_safe","version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
 def dg(request:Request):
