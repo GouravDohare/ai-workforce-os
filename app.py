@@ -10,6 +10,7 @@ SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+WORKER_MODEL = os.getenv("OPENAI_WORKER_MODEL", "gpt-4.1-mini")
 WEB = os.getenv("ENABLE_WEB_RESEARCH", "true").lower() == "true"
 TIMEOUT = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "150"))
 DEFAULT_BUDGET = float(os.getenv("DEFAULT_GOAL_BUDGET_USD", "5"))
@@ -41,6 +42,8 @@ MODEL_CALL_TIMEOUT = float(os.getenv("MODEL_CALL_TIMEOUT_SECONDS", "150"))
 RESEARCH_TIMEOUT = float(os.getenv("RESEARCH_TIMEOUT_SECONDS", "180"))
 RESEARCH_INITIAL_TOKENS = int(os.getenv("RESEARCH_INITIAL_TOKENS", "1200"))
 RESEARCH_ESCALATED_TOKENS = int(os.getenv("RESEARCH_ESCALATED_TOKENS", "1600"))
+WORKER_INITIAL_TOKENS = int(os.getenv("WORKER_INITIAL_TOKENS", "1600"))
+WORKER_ESCALATED_TOKENS = int(os.getenv("WORKER_ESCALATED_TOKENS", "2400"))
 
 app = FastAPI(title="AI Workforce OS", version=APP_VERSION)
 lock = threading.RLock()
@@ -339,7 +342,7 @@ def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,sp
     try:
         client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"),timeout=call_timeout,max_retries=0)
         kw={"model":model,"input":prompt,"max_output_tokens":tokens}
-        if not web:
+        if not web and model.startswith("gpt-5"):
             kw["reasoning"]={"effort":"minimal"}
         if schema:
             kw["text"]={"format":{"type":"json_schema","name":schema[0],"schema":schema[1],"strict":True}}
@@ -574,6 +577,32 @@ def normalize_plan_budgets(p, budget, rid=None):
         print(f"PLAN_BUDGET_NORMALIZED run={rid} total={sum(vals):.4f} budget={budget:.4f} changes={len(changes)}",flush=True)
     return p,changes
 
+def normalize_plan_contracts(p, rid=None):
+    """Normalize planner-generated execution controls without changing task meaning.
+    Time limits and retry counts are operational controls, so malformed values are
+    clamped to safe runtime bounds instead of forcing an otherwise usable plan into
+    deterministic fallback.
+    """
+    changes=[]
+    for t in p.get("tasks",[]):
+        ct=t.setdefault("contract",{})
+        try: old_t=int(ct.get("time_limit_seconds",120))
+        except Exception: old_t=120
+        new_t=max(30,min(900,old_t))
+        if old_t != new_t:
+            changes.append({"task_id":t.get("id"),"field":"contract.time_limit_seconds","from":old_t,"to":new_t})
+        ct["time_limit_seconds"]=new_t
+        try: old_a=int(t.get("max_attempts",2))
+        except Exception: old_a=2
+        new_a=max(1,min(3,old_a))
+        if old_a != new_a:
+            changes.append({"task_id":t.get("id"),"field":"max_attempts","from":old_a,"to":new_a})
+        t["max_attempts"]=new_a
+    if changes and rid:
+        event(rid,"PLAN_RUNTIME_NORMALIZED","planner runtime controls normalized",{"changes":changes})
+        print(f"PLAN_RUNTIME_NORMALIZED run={rid} changes={len(changes)}",flush=True)
+    return p,changes
+
 def valid_plan(p,budget):
     if not isinstance(p,dict) or not p.get("agents") or not p.get("tasks") or len(p["tasks"])>MAX_TASKS:
         raise ValueError("invalid plan size")
@@ -761,9 +790,12 @@ def task_run(rid,tid):
                     if not source_urls:
                         event(rid,"RESEARCH_NO_SOURCE_METADATA","web research returned no parseable source metadata; worker must label evidence as insufficient",{},tid)
                     transform_prompt=base+f"\nWEB RESEARCH MEMO:\n{clip(web_call['text'],MAX_WEB_MEMO_CHARS)}\nSOURCE URLS AVAILABLE:\n{jd(source_urls[:MAX_EVIDENCE_ITEMS])}\nConvert this into the required worker JSON. Use only source URLs from the available list; if none are available, set insufficient_evidence and do not invent citations."
-                    o=call(rid,tid,"task_structuring",transform_prompt,MODEL,False,("worker_output",WORKER),1200,float(t["budget_limit"])*.45,timeout_override=task_timeout)
+                    worker_tokens=WORKER_INITIAL_TOKENS if n==1 else WORKER_ESCALATED_TOKENS
+                    transform_prompt2=transform_prompt if n==1 else ("Convert the existing research memo into the required worker JSON. Be concise and complete; do not add prose outside the JSON schema.\n"+transform_prompt)
+                    o=call(rid,tid,"task_structuring" if n==1 else "task_structuring_escalated",transform_prompt2,WORKER_MODEL,False,("worker_output",WORKER),worker_tokens,float(t["budget_limit"])*.45,timeout_override=task_timeout)
                 else:
-                    o=call(rid,tid,"task",base+"\nReturn only the worker JSON schema.",MODEL,False,("worker_output",WORKER),2600,float(t["budget_limit"]),timeout_override=task_timeout)
+                    worker_tokens=2200 if n==1 else 3200
+                    o=call(rid,tid,"task" if n==1 else "task_escalated",base+"\nReturn only the worker JSON schema.",WORKER_MODEL,False,("worker_output",WORKER),worker_tokens,float(t["budget_limit"]),timeout_override=task_timeout)
                 d=parse_json(o["text"])
                 d=update_claim_evidence(rid,tid,d)
                 claims=d.get("claims",[])
@@ -827,14 +859,14 @@ def schedule(rid):
         launched=0
         terminal={"completed","failed","blocked","waiting_approval","cancelled","interrupted"}
         for t in ts:
-            if t["status"] not in {"pending","waiting_dependency","ready","retrying"}: continue
+            if t["status"] not in {"pending","waiting_dependency","ready"}: continue
             state,ds=dependency_state(rid,t["id"])
             if state=="blocked":
-                changed=x("UPDATE tasks SET status='blocked',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready','retrying')",("required dependency did not complete",now(),t["id"]))
+                changed=x("UPDATE tasks SET status='blocked',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready')",("required dependency did not complete",now(),t["id"]))
                 if changed is not None: event(rid,"TASK_BLOCKED","required dependency did not complete",{"dependencies":[dict(d) for d in ds]},t["id"])
                 continue
             if state=="waiting":
-                x("UPDATE tasks SET status='waiting_dependency',updated_at=? WHERE id=? AND status IN ('pending','ready','retrying')",(now(),t["id"]))
+                x("UPDATE tasks SET status='waiting_dependency',updated_at=? WHERE id=? AND status IN ('pending','ready')",(now(),t["id"]))
                 continue
             x("UPDATE tasks SET status='ready',updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','retrying')",(now(),t["id"]))
             with lock:
@@ -862,14 +894,14 @@ def schedule(rid):
         # Reconcile once more before declaring a stall. This catches a completion
         # written immediately after the first snapshot.
         progressed=False
-        for t in q("SELECT * FROM tasks WHERE run_id=? AND status IN ('pending','waiting_dependency','ready','retrying')",(rid,)):
+        for t in q("SELECT * FROM tasks WHERE run_id=? AND status IN ('pending','waiting_dependency','ready')",(rid,)):
             state,_=dependency_state(rid,t["id"])
             if state in {"ready","blocked"}: progressed=True; break
         if not launched and not progressed:
-            unresolved=[t["id"] for t in q("SELECT id FROM tasks WHERE run_id=? AND status IN ('pending','waiting_dependency','ready','retrying')",(rid,))]
+            unresolved=[t["id"] for t in q("SELECT id FROM tasks WHERE run_id=? AND status IN ('pending','waiting_dependency','ready')",(rid,))]
             event(rid,"SCHEDULER_STALLED","no runnable task and no active worker remains",{"unresolved_tasks":unresolved})
             for tid2 in unresolved:
-                x("UPDATE tasks SET status='failed',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready','retrying')",("scheduler stalled: unresolved dependency state",now(),tid2))
+                x("UPDATE tasks SET status='failed',error_type='logical',error_message=?,updated_at=? WHERE id=? AND status IN ('pending','waiting_dependency','ready')",("scheduler stalled: unresolved dependency state",now(),tid2))
             return
         time.sleep(SCHEDULER_POLL_SECONDS)
     event(rid,"RUN_DEADLINE_EXCEEDED","run deadline exceeded",{"run_timeout_seconds":RUN_TIMEOUT})
@@ -972,18 +1004,19 @@ Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exa
             plan=parse_json(p["text"])
             plan,role_changes=repair_plan(plan,rid)
             plan,budget_changes=normalize_plan_budgets(plan,float(g["budget"]),rid)
+            plan,runtime_changes=normalize_plan_contracts(plan,rid)
             valid_plan(plan,float(g["budget"]))
             degraded=0
-            if role_changes or budget_changes:
+            if role_changes or budget_changes or runtime_changes:
                 event(rid,"PLANNER_VALIDATED_AFTER_REPAIR","planner output repaired and validated; no fallback used",
-                      {"role_changes":len(role_changes),"budget_changes":len(budget_changes)})
+                      {"role_changes":len(role_changes),"budget_changes":len(budget_changes),"runtime_changes":len(runtime_changes)})
                 print(f"PLANNER_VALIDATED_AFTER_REPAIR run={rid} role_changes={len(role_changes)} budget_changes={len(budget_changes)}",flush=True)
-            event(rid,"PLANNER_COMPLETED","CEO planner produced a valid structured plan",{"agents":len(plan["agents"]),"tasks":len(plan["tasks"]),"repaired":bool(role_changes or budget_changes)})
+            event(rid,"PLANNER_COMPLETED","CEO planner produced a valid structured plan",{"agents":len(plan["agents"]),"tasks":len(plan["tasks"]),"repaired":bool(role_changes or budget_changes or runtime_changes)})
             print(f"PLANNER_COMPLETED run={rid} agents={len(plan['agents'])} tasks={len(plan['tasks'])} repaired={bool(role_changes or budget_changes)}",flush=True)
         except Exception as e:
             event(rid,"PLANNER_FALLBACK","planner output could not be safely repaired/validated; deterministic fallback used",{"error_type":classify(e),"error":str(e)})
             print(f"PLANNER_FALLBACK run={rid} error_type={classify(e)} error={e}",flush=True)
-            plan=fallback(g);plan,_=normalize_plan_budgets(plan,float(g["budget"]),rid);valid_plan(plan,float(g["budget"]));degraded=1;event(rid,"PLANNER_DEGRADED","safe fallback planner used",{"error":str(e)})
+            plan=fallback(g);plan,_=normalize_plan_budgets(plan,float(g["budget"]),rid);plan,_=normalize_plan_contracts(plan,rid);valid_plan(plan,float(g["budget"]));degraded=1;event(rid,"PLANNER_DEGRADED","safe fallback planner used",{"error":str(e)})
         x("UPDATE goals SET plan=?,planner_degraded=?,updated_at=? WHERE id=?",(jd(plan),degraded,now(),g["id"]))
         roles={}
         for a in plan["agents"]:
@@ -1092,7 +1125,7 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
 def dg(request:Request):
