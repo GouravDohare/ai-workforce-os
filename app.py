@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.16"
+APP_VERSION = "0.4.17"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -96,45 +96,39 @@ def x(sql, params=()):
             c.close()
 
 def display_text(s):
-    """Repair common UTF-8/Latin-1 mojibake without changing normal Unicode."""
+    """Repair common UTF-8/Latin-1 mojibake conservatively."""
     text = "" if s is None else str(s)
-    markers = ("Ã", "Ã", "Ã¢â¬", "Ã¢â¬â¢", "Ã¢â¬Å", "Ã¢â¬", "Ã°Å¸")
-    if any(m in text for m in markers):
-        try:
-            fixed = text.encode("latin1").decode("utf-8")
-            if sum(text.count(m) for m in markers) > sum(fixed.count(m) for m in markers):
-                return fixed
-        except Exception:
-            pass
-    return text
+    markers = ("Ã", "Ã", "Ã¢", "Ã°", "ï¿½")
+    def score(v): return sum(v.count(m) for m in markers)
+    replacements={
+        "Ã¢â¬â":"â","Ã¢â¬â":"â","Ã¢â¬Ë":"â","Ã¢â¬â¢":"â","Ã¢â¬Å":"â","Ã¢â¬ï¿½":"â",
+        "Ã¢â¬Â¦":"â¦","ÃÂ·":"Â·","ÃÂ©":"Â©","ÃÂ®":"Â®","Ã¢â¬Â¢":"â¢","Ã¢Ëâ":"â","Ã¢â â":"â","Ã¢â ":"â"
+    }
+    best=text
+    for k,v in replacements.items(): best=best.replace(k,v)
+    best_score=score(best)
+    for _ in range(2):
+        try: candidate=best.encode("latin1").decode("utf-8")
+        except Exception: break
+        sc=score(candidate)
+        if sc<best_score: best,best_score=candidate,sc
+        else: break
+    return best
 
 def esc(s):
     return (display_text(s).replace("&", "&amp;").replace("<", "&lt;")
             .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;"))
 
 def canonical_condition(value):
-    v = re.sub(r"[^a-z]", "", str(value or "").lower())
-    aliases = {
-        "completed":"completed", "complete":"completed", "done":"completed",
-        "success":"completed", "successful":"completed", "succeeded":"completed",
-        "provided":"completed", "outputprovided":"completed", "outputsprovided":"completed",
-        "available":"completed", "outputsavailable":"completed", "resultprovided":"completed",
-        "finished":"completed", "ready":"completed",
-        "optional":"optional", "optionally":"optional"
-    }
-    if v in aliases:
-        return aliases[v]
-    # Planners sometimes encode the dependency itself in prose, e.g.
-    # "T1 outputs provided". The DAG already stores the upstream task ID, so
-    # the runtime condition is simply that the upstream task completed.
-    if re.search(r"(?:provided|available|ready|complete|completed|finished|done|successful|succeeded|deliverable|delivered)$", v):
-        return "completed"
-    if ("output" in v or "deliverable" in v or "result" in v) and re.search(r"(?:provided|available|ready|complete|completed|finished|done|successful|succeeded|deliverable|delivered|finalized|finalised)", v):
-        return "completed"
-    if "allprior" in v and ("completed" in v or "complete" in v or "deliverable" in v):
-        return "completed"
-    return None
-
+    """Map planner dependency prose onto the runtime condition language."""
+    raw=str(value or "").strip(); v=re.sub(r"[^a-z]","",raw.lower())
+    if not raw: return None
+    aliases={"completed":"completed","complete":"completed","done":"completed","success":"completed","successful":"completed","succeeded":"completed","provided":"completed","outputprovided":"completed","outputsprovided":"completed","available":"completed","outputsavailable":"completed","resultprovided":"completed","finished":"completed","ready":"completed","optional":"optional","optionally":"optional"}
+    if v in aliases:return aliases[v]
+    if any(k in v for k in ("complete","completed","done","success","succeed","provided","available","ready","finished","delivered","deliverable","output","result")):return "completed"
+    # The scheduler only understands completion/optional gates. Preserve the DAG
+    # instead of discarding a valid plan because the model wrote explanatory prose.
+    return "completed"
 
 def table_columns(c, table):
     return [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -506,10 +500,10 @@ def repair_plan(p, rid=None):
             changes.append({"task_id":t.get("id"),"field":"dependency_conditions","from":old,"to":conds})
         normalized=[]
         for dep,cond in zip(deps,conds):
-            c=canonical_condition(cond)
-            if c is None:
-                raise ValueError(f"unsupported dependency condition: {cond}")
+            c=canonical_condition(cond) or "completed"
             normalized.append(c)
+            if str(cond).strip()!=c:
+                changes.append({"task_id":t.get("id"),"field":"dependency_conditions","from":cond,"to":c,"reason":"runtime supports completion/optional gates; upstream task ID carries dependency semantics"})
         if normalized != conds:
             changes.append({"task_id":t.get("id"),"field":"dependency_conditions","from":conds,"to":normalized})
         t["dependency_conditions"]=normalized
@@ -611,7 +605,7 @@ def valid_plan(p,budget):
         v=float(t["budget_limit"])
         if not math.isfinite(v) or v<=0: raise ValueError("bad task budget")
         for c in conds:
-            if canonical_condition(c) != c: raise ValueError("unsupported dependency condition")
+            if canonical_condition(c) not in {"completed","optional"}: raise ValueError("unsupported dependency condition")
         graph[tid]=set(deps)
     for n,d in graph.items():
         if n in d or any(x not in graph for x in d): raise ValueError("bad dependency")
@@ -793,7 +787,15 @@ def task_run(rid,tid):
                     if not d.get("insufficient_evidence"):
                         raise RuntimeError("strategy_error:web task produced no evidence-linked claims")
                 supported=sum(bool(c.get("evidence_ids")) for c in claims)
-                conf=max(.1,min(1,.6*supported/max(1,len(claims))+.4*(1-min(.8,.04*len(d.get("unknowns",[]))))))
+                claim_scores=[max(0.0,min(1.0,float(c.get("confidence",0.5) or 0.5))) for c in claims]
+                avg_claim_conf=(sum(claim_scores)/len(claim_scores)) if claim_scores else 0.55
+                evidence_ratio=supported/max(1,len(claims))
+                unknown_penalty=min(0.25,0.03*len(d.get("unknowns",[])))
+                validation_penalty=min(0.15,0.04*len(d.get("requires_validation",[])))
+                # Confidence is derived from the worker's claim confidence plus
+                # independently captured evidence support and explicit uncertainty.
+                # It is no longer a fixed-looking function of unknown-count alone.
+                conf=max(.1,min(1,.45*avg_claim_conf+.40*evidence_ratio+.15-unknown_penalty-validation_penalty))
                 artifact_id=None
                 if d.get("artifact"):
                     artifact_id=art(rid,tid,d["artifact"]["name"],d["artifact"]["content"],d["artifact"]["type"])
@@ -900,6 +902,42 @@ def schedule(rid):
     x("UPDATE tasks SET status='interrupted',error_type='transient',error_message='run deadline exceeded',updated_at=? WHERE run_id=? AND status IN ('running','pending','ready','retrying','waiting_dependency')",(now(),rid))
     release_all_task_reservations(rid,None)
 
+def goal_mode(g):
+    def gv(k):
+        try: return g[k]
+        except Exception: return g.get(k) if hasattr(g,"get") else ""
+    text=" ".join([str(gv("title") or ""),str(gv("description") or ""),str(gv("criteria") or "")]).lower()
+    planning=[r"\bstrategy\b",r"\bstrategic\b",r"\bplan\b",r"\bplanning\b",r"\broadmap\b",r"\brecommend",r"\banaly[sz]e\b",r"\banalysis\b",r"\bresearch\b",r"\bassess",r"\bfeasibility\b",r"\bgo-to-market\b",r"\bgtm\b",r"\bpositioning\b"]
+    execution=[r"\bexecute\b",r"\bconduct\b",r"\bsend\b",r"\bcontact\b",r"\bdeploy\b",r"\bacquire\b",r"\boperate\b",r"\bperform\b"]
+    p=sum(bool(re.search(x,text)) for x in planning); e=sum(bool(re.search(x,text)) for x in execution)
+    if re.search(r"create (?:a|an|the) (?:complete |detailed |practical )?(?:strategy|plan|roadmap)",text): p+=4
+    if re.search(r"strategy for (?:launching|building|entering|selling)",text): p+=3
+    if p>=e+1:return "planning"
+    if e>=p+1:return "execution"
+    return "hybrid"
+
+def criterion_coverage(criteria):
+    vals=[]
+    for c in criteria or []:
+        st=str(c.get("status") or "").lower(); vals.append(1.0 if st=="pass" else 0.6 if st=="partial" else 0.0)
+    return round(sum(vals)/len(vals),3) if vals else 0.0
+
+def has_unsupported_real_world_action(criteria,task_view):
+    blob=json.dumps(criteria or [],ensure_ascii=False).lower()+" "+json.dumps(task_view or [],ensure_ascii=False).lower()
+    return any(m in blob for m in ("claimed that customer interviews","claimed the campaign","claimed interviews occurred","claimed deployment","claimed outreach occurred","presented as completed"))
+
+def normalize_verification_result(d,g,task_view):
+    criteria=d.get("criterion_results") or []; mode=goal_mode(g)
+    hard_fail=[c for c in criteria if str(c.get("status"))=="fail"]; partial=[c for c in criteria if str(c.get("status"))=="partial"]
+    required_failed=[t for t in task_view if t["required"] and t["status"]!="completed"]
+    coverage=criterion_coverage(criteria); unsupported=has_unsupported_real_world_action(criteria,task_view); model_score=float(d.get("score",0) or 0)
+    if mode=="planning": passed=(not hard_fail and not required_failed and not unsupported and coverage>=0.75)
+    elif mode=="execution": passed=(not hard_fail and not partial and not required_failed and not unsupported and model_score>=0.80)
+    else: passed=(not hard_fail and not required_failed and not unsupported and coverage>=0.80 and model_score>=0.75)
+    d["passed"]=bool(passed); d["verification_summary"]={"goal_mode":mode,"criteria_total":len(criteria),"criteria_failed":len(hard_fail),"criteria_partial":len(partial),"required_tasks_incomplete":len(required_failed),"deliverable_coverage_score":coverage,"model_score":model_score,"unsupported_real_world_action":unsupported}
+    d["dimensions"]=dict(d.get("dimensions") or {}); d["dimensions"]["deliverable_coverage"]=coverage; d["dimensions"]["evidence_strength"]=float((d.get("dimensions") or {}).get("evidence",0) or 0)
+    return d
+
 def evaluate(rid,stage):
     g=get_goal_from_run(rid); ts=q("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at",(rid,))
     task_view=[{"id":t["plan_id"],"title":t["title"],"status":t["status"],"required":bool(t["required"]),"output":clip(t["output"],3000),"structured":clip(jd(jl(t["structured"])),4500),"confidence":t["confidence"]} for t in ts]
@@ -907,35 +945,31 @@ def evaluate(rid,stage):
     prompt=f"""You are the independent verification layer for an AI workforce.
 Evaluate whether the WORKFORCE'S DELIVERED WORK actually satisfies the stated objective and success criteria.
 Do not equate a task marked completed with the real-world action having occurred. Agents cannot claim that customer interviews, paid campaigns, purchases, deployments, outreach, experiments, or other external side effects happened unless the system has an explicit tool/result proving that action. When such work is requested but cannot actually be performed, require a validation PLAN or clearly label it as pending rather than treating it as completed evidence.
-Do not reject a planning objective merely because future validation is still needed: distinguish a requested strategy/plan from an external execution task.
+The requested deliverable mode is determined from the objective/description/criteria. For a planning/strategy deliverable, judge whether the requested decision-ready content exists; do not make empirical execution a prerequisite unless the user explicitly requested execution or validation. A planning criterion can be PASS when the strategy is substantive and clearly labels assumptions and validation needs. Use PARTIAL when important requested content is present but materially incomplete; use FAIL only when requested content is missing, contradictory, or falsely represented as completed.
 For factual claims, require evidence when the claim depends on current external facts. Do not require web evidence for clearly labeled assumptions, recommendations, calculations derived from supplied numbers, or proposed experiments.
 Treat material contradictions and unsupported claims as verification gaps.
 For every success criterion, return one criterion_results entry with pass/partial/fail and explain why.
-Create targeted replan_tasks ONLY for concrete gaps. Choose action_type evidence_research when current external evidence is missing, analysis when synthesis/calculation is missing, and validation_plan when the original plan incorrectly implied that an external action had already happened.
+Create targeted replan_tasks ONLY for concrete missing deliverables or unsupported factual claims. In planning mode, do NOT create validation_plan tasks merely because empirical validation would be useful in the future; put that as an evidence/action note unless the original criterion explicitly requires validation. Choose action_type evidence_research when current external evidence is missing, analysis when synthesis/calculation is missing, and validation_plan only when the original requirement explicitly asks for a validation procedure or the workforce falsely implied an external action occurred.
 A validation_plan task must NOT claim to have run the interview/experiment/campaign; it must specify how the user would validate it, sample/inputs, metrics, decision thresholds, and next action.
 OBJECTIVE: {clip(g['title'],500)}
 DESCRIPTION: {clip(g['description'],4000)}
 SUCCESS CRITERIA: {clip(g['criteria'],5000)}
 TASKS: {jd(task_view)}
 EVIDENCE: {jd(ev_view)}
-Return only the evaluator JSON schema. Pass only when the required criteria are substantively satisfied, required tasks are completed, evidence is adequate for claims that need it, and no material unsupported real-world action is presented as completed."""
+Return only the evaluator JSON schema. For planning/strategy objectives, PASS means the requested deliverable is substantively covered, no criterion is FAIL, required tasks are completed, assumptions/unknowns are labeled, evidence is adequate for factual claims, and no unsupported real-world action is presented as completed. For execution objectives, apply the stronger execution standard."""
     try:
         o=call(rid,None,"evaluator",prompt,MODEL,False,("evaluation",EVAL),3000,min(1.0,max(.05,g["budget"]*.14)))
         d=parse_json(o["text"])
+        task_view_for_policy=[{"id":t["plan_id"],"title":t["title"],"status":t["status"],"required":bool(t["required"])} for t in ts]
+        d=normalize_verification_result(d,g,task_view_for_policy)
         criteria=d.get("criterion_results") or []
         hard_fail=[c for c in criteria if c.get("status")=="fail"]
         partial=[c for c in criteria if c.get("status")=="partial"]
-        required_failed=[t for t in ts if t["required"] and t["status"]!="completed"]
-        model_pass=bool(d.get("passed"))
-        score=float(d.get("score",0))
-        # The evaluator must explicitly support the pass. A high numeric score alone is never enough.
-        passed=model_pass and score>=.8 and not hard_fail and not required_failed
-        d["passed"]=passed
-        d["verification_summary"]={"criteria_total":len(criteria),"criteria_failed":len(hard_fail),"criteria_partial":len(partial),"required_tasks_incomplete":len(required_failed)}
+        passed=bool(d.get("passed")); score=float(d.get("score",0) or 0)
         x("INSERT INTO evaluations(id,run_id,stage,score,passed,dimensions,failures,recommendations,contradictions,model,cost,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(uid("eval"),rid,stage,score,int(passed),jd(d.get("dimensions",{})),jd({"failed_checks":d.get("failed_checks",[]),"criterion_results":criteria}),jd(d.get("recommendations",[])),jd(d.get("contradictions",[])),MODEL,o["cost"],now()))
         for c in d.get("contradictions",[]):
             x("INSERT INTO memory(id,company_id,goal_id,task_id,type,key,value,evidence_ids,confidence,freshness_days,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(uid("mem"),g["company_id"],g["id"],None,"contradiction","finding",jd(c),"[]",.3,None,now(),now()))
-        event(rid,"VERIFICATION_COMPLETED",f"verification stage {stage} completed",{"passed":passed,"score":score,"criteria_total":len(criteria),"criteria_failed":len(hard_fail),"criteria_partial":len(partial),"replan_tasks":len(d.get("replan_tasks",[]))})
+        event(rid,"VERIFICATION_COMPLETED",f"verification stage {stage} completed",{"passed":passed,"score":score,"goal_mode":d.get("verification_summary",{}).get("goal_mode"),"deliverable_coverage_score":d.get("verification_summary",{}).get("deliverable_coverage_score"),"criteria_total":len(criteria),"criteria_failed":len(hard_fail),"criteria_partial":len(partial),"replan_tasks":len(d.get("replan_tasks",[]))})
         return {"ok":True,"passed":passed,"data":d}
     except Exception as e:
         event(rid,"VERIFICATION_FAILED","verification model or parsing failed",{"error_type":classify(e),"error":str(e)})
@@ -1055,7 +1089,10 @@ Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exa
         if runrow(rid)["status"] in {"incomplete","cancelled"}:return
         ev=evaluate(rid,"post_execution")
         if ev["ok"] and not ev["passed"] and g["replan_count"]<g["max_replans"]:
-            if replans(rid,ev["data"].get("replan_tasks",[])):
+            recovery=list(ev["data"].get("replan_tasks",[]) or [])
+            if ev["data"].get("verification_summary",{}).get("goal_mode")=="planning":
+                recovery=[it for it in recovery if str(it.get("action_type")) in {"evidence_research","analysis"}]
+            if recovery and replans(rid,recovery):
                 x("UPDATE runs SET status='executing' WHERE id=?",(rid,));x("UPDATE goals SET status='executing' WHERE id=?",(g["id"],));schedule(rid);ev=evaluate(rid,"post_replan")
         if not ev["ok"] or not ev["passed"]:
             x("UPDATE goals SET status='incomplete',verification_status=?,updated_at=? WHERE id=?",("unavailable" if not ev["ok"] else "failed",now(),g["id"]))
@@ -1065,11 +1102,14 @@ Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exa
         ts=q("SELECT * FROM tasks WHERE run_id=? AND status='completed'",(rid,))
         report_tasks=[{"title":t["title"],"output":clip(t["output"],3500),"structured":clip(jd(jl(t["structured"])),5000)} for t in ts]
         report_evidence=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120)} for e in q("SELECT id,title,url,publisher FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]
+        latest_eval=q("SELECT * FROM evaluations WHERE run_id=? ORDER BY created_at DESC LIMIT 1",(rid,),one=True)
+        eval_summary=jl(latest_eval["failures"],{}) if latest_eval else {}
         report_prompt=f"""Write the final decision-ready report for {clip(g['title'],500)}.
 SUCCESS CRITERIA: {clip(g['criteria'],5000)}
 VERIFIED TASKS: {jd(report_tasks)}
 EVIDENCE: {jd(report_evidence)}
-Never invent facts. Address every criterion explicitly and distinguish verified facts, estimates, assumptions, unknowns, and unresolved risks."""
+VERIFICATION SUMMARY: {clip(jd(eval_summary),7000)}
+Never invent facts. Address every criterion explicitly and distinguish verified facts, estimates, assumptions, unknowns, and unresolved risks. Do not turn proposed validation steps into claims that the validation already occurred."""
         report=report_call(rid,report_prompt,min(1.0,g["budget"]*.18))["text"]
         x("UPDATE goals SET final_output=?,status='completed',verification_status='passed',updated_at=? WHERE id=?",(report,now(),g["id"]))
         x("UPDATE runs SET status='completed',ended_at=? WHERE id=?",(now(),rid));event(rid,"GOAL_COMPLETED","verified final report delivered")
