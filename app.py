@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.19"
+APP_VERSION = "0.4.20"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -42,6 +42,8 @@ MAX_TASKS = int(os.getenv("MAX_TASKS", "16"))
 TASK_BUDGET_FRACTION = float(os.getenv("TASK_BUDGET_FRACTION", "0.70"))
 RUN_TIMEOUT = float(os.getenv("RUN_TIMEOUT_SECONDS", "900"))
 PLANNER_TIMEOUT = float(os.getenv("PLANNER_TIMEOUT_SECONDS", "75"))
+PLANNER_INITIAL_TOKENS = int(os.getenv("PLANNER_INITIAL_TOKENS", "4200"))
+PLANNER_ESCALATED_TOKENS = int(os.getenv("PLANNER_ESCALATED_TOKENS", "7000"))
 MODEL_CALL_TIMEOUT = float(os.getenv("MODEL_CALL_TIMEOUT_SECONDS", "150"))
 RESEARCH_TIMEOUT = float(os.getenv("RESEARCH_TIMEOUT_SECONDS", "180"))
 RESEARCH_INITIAL_TOKENS = int(os.getenv("RESEARCH_INITIAL_TOKENS", "1200"))
@@ -791,26 +793,40 @@ def fallback(g):
         ],"verification":{"required_checks":["criteria","evidence","contradictions","budget","unknowns"]}}
 
 def extract_sources(r):
+    """Extract web sources without serializing the entire OpenAI SDK object graph.
+
+    The Responses SDK contains polymorphic Pydantic models. Calling model_dump() on
+    the complete response can emit serializer warnings for tool-call variants. We only
+    need source metadata, so walk the small set of relevant fields directly.
+    """
     found=[]
-    def walk(v):
+    seen=set()
+    def walk(v, depth=0):
+        if v is None or depth>8:
+            return
         if isinstance(v,dict):
             url=v.get("url") or v.get("source_url") or v.get("source_website_url")
-            if url and isinstance(url,str) and url.startswith(("http://","https://")):
+            if isinstance(url,str) and url.startswith(("http://","https://")):
                 found.append({"url":url,"title":v.get("title") or v.get("name") or url,"publisher":v.get("publisher") or v.get("domain")})
-            for vv in v.values():walk(vv)
-        elif isinstance(v,(list,tuple)):
-            for vv in v:walk(vv)
-        else:
+            for key in ("output","content","action","sources","results","items"):
+                if key in v: walk(v.get(key),depth+1)
+            return
+        if isinstance(v,(list,tuple)):
+            for vv in v: walk(vv,depth+1)
+            return
+        if isinstance(v,(str,int,float,bool)):
+            return
+        for key in ("output","content","action","sources","results","items","url","source_url","source_website_url","title","name","publisher","domain"):
             try:
-                if hasattr(v,"model_dump"):walk(v.model_dump())
-                elif hasattr(v,"__dict__"):walk(vars(v))
-            except Exception:pass
+                if hasattr(v,key):
+                    vv=getattr(v,key)
+                    if key in {"url","source_url","source_website_url"} and isinstance(vv,str) and vv.startswith(("http://","https://")):
+                        found.append({"url":vv,"title":getattr(v,"title",None) or getattr(v,"name",None) or vv,"publisher":getattr(v,"publisher",None) or getattr(v,"domain",None)})
+                    elif key not in {"url","source_url","source_website_url","title","name","publisher","domain"}:
+                        walk(vv,depth+1)
+            except Exception:
+                pass
     walk(getattr(r,"output",[]))
-    try:
-        dump=r.model_dump() if hasattr(r,"model_dump") else None
-        if dump: walk(dump.get("output",dump))
-    except Exception:
-        pass
     for u in extract_text_urls(getattr(r,"output_text",None)):
         found.append({"url":u,"title":u,"publisher":None})
     uniq={}
@@ -1215,6 +1231,38 @@ def report_call(rid, prompt, spend_cap):
         )
         return call(rid,None,"report_escalated",compact,MODEL,False,None,10000,spend_cap)
 
+def planner_call(rid, goal, spend_cap):
+    """Call the planner once, then retry only when the provider truncates output.
+
+    The planner produces a compact machine-readable DAG; detailed prose belongs to
+    workers. A token-ceiling retry is safer than immediately switching to the
+    deterministic four-task fallback because it preserves goal-specific planning.
+    """
+    g=goal
+    planner_prompt=f"""Act as the CEO/orchestrator. Build the minimum sufficient executable workforce for this objective.
+OBJECTIVE: {g['title']}
+DESCRIPTION: {g['description']}
+SUCCESS CRITERIA: {g['criteria']}
+BUDGET: ${g['budget']}
+Return ONLY valid plan JSON matching the supplied schema. Keep the JSON compact: normally 3-6 agents and 4-8 tasks. Do not write explanations outside JSON.
+Every task must have one owner and short instructions. CRITICAL: task.agent_role MUST exactly equal a declared agents[].role. Dependencies must reference existing task IDs. Every task needs a concise machine-readable contract. Use action_type only from research, analysis, validation_plan, external_action, approval_required. The current runtime has web research but NO external side-effect executor, so any real-world action such as sending messages, calls/interviews, outreach, campaigns, deployment, purchasing, scheduling, or writing to external systems MUST be validation_plan. Never imply such an action was completed merely because the task ran. Use web research only when current external facts are needed. Separate research, synthesis, verification, and final reporting where useful."""
+    try:
+        return call(rid,None,"planner",planner_prompt,MODEL,False,("ceo_plan",PLAN),PLANNER_INITIAL_TOKENS,spend_cap,timeout_override=PLANNER_TIMEOUT)
+    except Exception as first_planner_error:
+        if "incomplete_output:max_output_tokens" not in str(first_planner_error):
+            raise
+        event(rid,"PLANNER_ESCALATED","planner output ceiling reached; retrying with a compact planner prompt and larger output ceiling",
+              {"initial_tokens":PLANNER_INITIAL_TOKENS,"escalated_tokens":PLANNER_ESCALATED_TOKENS})
+        print(f"PLANNER_ESCALATED run={rid} from={PLANNER_INITIAL_TOKENS} to={PLANNER_ESCALATED_TOKENS}",flush=True)
+        compact_planner_prompt=f"""Create ONLY the executable workforce plan JSON for this goal.
+Goal: {g['title']}
+Description: {clip(g['description'],9000)}
+Criteria: {clip(g['criteria'],9000)}
+Budget: ${g['budget']}
+Keep it concise: 3-5 agents, 4-7 tasks. No prose outside JSON. Each task needs an exact declared agent_role, existing task-ID dependencies, concise instructions, a positive budget, and the full contract fields required by the schema. Use action_type research/analysis/validation_plan/approval_required; use external_action only if a supported side-effect tool exists. There are currently no side-effect tools, so real-world calls, outreach, campaigns, purchases, deployments, scheduling, external writes, and interviews must be validation_plan rather than completed actions. Prefer a small coherent DAG over redundant tasks."""
+        return call(rid,None,"planner_retry",compact_planner_prompt,MODEL,False,("ceo_plan",PLAN),PLANNER_ESCALATED_TOKENS,spend_cap,timeout_override=PLANNER_TIMEOUT)
+
+
 def execute(rid):
     run_started=time.time()
     try:
@@ -1225,14 +1273,7 @@ def execute(rid):
         event(rid,"PLANNER_STARTED","CEO planner stage started",{"timeout_seconds":PLANNER_TIMEOUT,"model":MODEL})
         print(f"PLANNER_STARTED run={rid} goal={g['id']} timeout={PLANNER_TIMEOUT}s",flush=True)
         try:
-            planner_prompt=f"""Act as the CEO/orchestrator. Build the MINIMUM sufficient workforce for this objective.
-OBJECTIVE: {g['title']}
-DESCRIPTION: {g['description']}
-SUCCESS CRITERIA: {g['criteria']}
-BUDGET: ${g['budget']}
-Return ONLY the required plan JSON. Keep it compact: normally 3-6 agents and 4-8 tasks.
-Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exactly equal one of the declared agents[].role values; never invent an owner role. Explicit dependencies must reference task IDs that exist. Every task needs a machine-readable contract, realistic positive budget, and short instruction. Set contract.action_type to research, analysis, validation_plan, external_action, or approval_required. IMPORTANT: the current runtime has web research but no external side-effect executor. Therefore any task that would send messages, conduct interviews/calls, perform outreach, run campaigns, deploy, purchase, schedule, write to external systems, or otherwise change the outside world MUST be action_type=validation_plan unless an allowed side-effect tool is explicitly available. Never describe an external action as completed merely because a task ran. Use web research only where current external facts are genuinely required. Separate research from synthesis and verification."""
-            p=call(rid,None,"planner",planner_prompt,MODEL,False,("ceo_plan",PLAN),2800,min(1.0,g["budget"]*.18),timeout_override=PLANNER_TIMEOUT)
+            p=planner_call(rid,g,min(1.0,g["budget"]*.18))
             plan=parse_json(p["text"])
             plan,role_changes=repair_plan(plan,rid)
             plan,runtime_changes=normalize_plan_runtime_controls(plan,rid)
@@ -1364,7 +1405,7 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"planner_runtime_normalization":True,"verification_engine":"criterion_level_revision_v2_action_safe","version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"planner_initial_tokens":PLANNER_INITIAL_TOKENS,"planner_escalated_tokens":PLANNER_ESCALATED_TOKENS,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"planner_runtime_normalization":True,"verification_engine":"criterion_level_revision_v2_action_safe","version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
 def dg(request:Request):
