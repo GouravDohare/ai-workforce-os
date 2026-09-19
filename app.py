@@ -365,8 +365,21 @@ def repair_plan(p, rid=None):
                 chosen=scores[0][1]
         t["agent_role"]=chosen
         changes.append({"task_id":t.get("id"),"from":r,"to":chosen})
+    # Normalize dependency-condition cardinality. The planner occasionally returns
+    # a valid dependency list with a missing/extra condition entry. Since the
+    # scheduler's default semantics are "upstream must complete", repair only
+    # the cardinality mismatch rather than discarding the whole plan.
+    dep_changes=[]
+    for t in p.get("tasks",[]):
+        deps=t.get("depends_on") or []
+        conds=t.get("dependency_conditions") or []
+        if len(deps)!=len(conds):
+            old_conds=list(conds)
+            t["dependency_conditions"]=["completed"]*len(deps)
+            dep_changes.append({"task_id":t.get("id"),"depends_on":deps,"from":old_conds,"to":t["dependency_conditions"]})
+    changes.extend(dep_changes)
     if changes and rid:
-        event(rid,"PLAN_REPAIRED","planner task-owner aliases normalized",{"changes":changes})
+        event(rid,"PLAN_REPAIRED","planner inconsistencies normalized",{"changes":changes})
         print(f"PLAN_REPAIRED run={rid} changes={changes}",flush=True)
     return p, changes
 
@@ -585,6 +598,28 @@ def replans(rid,items):
         x("UPDATE goals SET replan_count=replan_count+1,status='replanning',updated_at=? WHERE id=?",(now(),g["id"]));event(rid,"REPLAN_CREATED","targeted recovery tasks created",{"count":n})
     return n
 
+def report_call(rid, prompt, spend_cap):
+    """Generate the final report with an adaptive output ceiling.
+    Reports are synthesis-heavy and can legitimately consume more reasoning/output
+    tokens than diagnostics. A truncation is therefore retried with a larger ceiling
+    and a compact instruction, instead of failing the entire run.
+    """
+    try:
+        return call(rid,None,"report",prompt,MODEL,False,None,6000,spend_cap)
+    except Exception as e:
+        if "incomplete_output:max_output_tokens" not in str(e):
+            raise
+        event(rid,"REPORT_ESCALATED","final report output ceiling reached; escalating with compact prompt",
+              {"initial_tokens":6000,"escalated_tokens":10000})
+        print(f"REPORT_ESCALATED run={rid} from=6000 to=10000",flush=True)
+        compact=(
+            "Write a concise but complete decision-ready final report. Address EVERY success criterion. "
+            "Use headings and bullets/tables where useful. Do not repeat evidence unnecessarily. "
+            "Clearly label facts, estimates, assumptions, unknowns, and risks. "
+            "End with a criterion-by-criterion conclusion.\n" + prompt
+        )
+        return call(rid,None,"report_escalated",compact,MODEL,False,None,10000,spend_cap)
+
 def execute(rid):
     run_started=time.time()
     try:
@@ -637,7 +672,12 @@ Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exa
         if time.time()-run_started > RUN_TIMEOUT:
             raise RuntimeError("run deadline exceeded before final report")
         ts=q("SELECT * FROM tasks WHERE run_id=? AND status='completed'",(rid,))
-        report=call(rid,None,"report",f"Write the final decision-ready report for {g['title']}. Criteria: {g['criteria']} VERIFIED TASKS: {jd([{'title':t['title'],'output':t['output'],'structured':jl(t['structured'])} for t in ts])} EVIDENCE: {jd([dict(e) for e in q('SELECT id,title,url,publisher FROM evidence WHERE run_id=?',(rid,))])}. Never invent facts.",MODEL,False,None,3500,min(1.0,g["budget"]*.18))["text"]
+        report_prompt=f"""Write the final decision-ready report for {g['title']}.
+SUCCESS CRITERIA: {g['criteria']}
+VERIFIED TASKS: {jd([{'title':t['title'],'output':t['output'],'structured':jl(t['structured'])} for t in ts])}
+EVIDENCE: {jd([dict(e) for e in q('SELECT id,title,url,publisher FROM evidence WHERE run_id=?',(rid,))])}
+Never invent facts. Address every criterion explicitly and distinguish verified facts, estimates, assumptions, unknowns, and unresolved risks."""
+        report=report_call(rid,report_prompt,min(1.0,g["budget"]*.18))["text"]
         x("UPDATE goals SET final_output=?,status='completed',verification_status='passed',updated_at=? WHERE id=?",(report,now(),g["id"]))
         x("UPDATE runs SET status='completed',ended_at=? WHERE id=?",(now(),rid));event(rid,"GOAL_COMPLETED","verified final report delivered")
     except Exception as e:
