@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.12"
+APP_VERSION = "0.4.16"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -27,6 +27,11 @@ RATE_LIMIT_BACKOFF_SECONDS = float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "6"))
 WEB_MODEL = os.getenv("OPENAI_WEB_MODEL", "gpt-4.1-mini")
 WEB_INPUT_PRICE = float(os.getenv("OPENAI_WEB_INPUT_PRICE_PER_MTOK", ".40"))
 WEB_OUTPUT_PRICE = float(os.getenv("OPENAI_WEB_OUTPUT_PRICE_PER_MTOK", "1.60"))
+WORKER_MODEL = os.getenv("OPENAI_WORKER_MODEL", "gpt-4.1-mini")
+WORKER_INPUT_PRICE = float(os.getenv("OPENAI_WORKER_INPUT_PRICE_PER_MTOK", ".40"))
+WORKER_OUTPUT_PRICE = float(os.getenv("OPENAI_WORKER_OUTPUT_PRICE_PER_MTOK", "1.60"))
+WORKER_INITIAL_TOKENS = int(os.getenv("WORKER_INITIAL_TOKENS", "2200"))
+WORKER_ESCALATED_TOKENS = int(os.getenv("WORKER_ESCALATED_TOKENS", "3200"))
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "24000"))
 MAX_EVIDENCE_ITEMS = int(os.getenv("MAX_EVIDENCE_ITEMS", "12"))
 MAX_UPSTREAM_CHARS = int(os.getenv("MAX_UPSTREAM_CHARS", "7000"))
@@ -122,7 +127,11 @@ def canonical_condition(value):
     # Planners sometimes encode the dependency itself in prose, e.g.
     # "T1 outputs provided". The DAG already stores the upstream task ID, so
     # the runtime condition is simply that the upstream task completed.
-    if re.search(r"(?:provided|available|ready|complete|completed|finished|done|successful|succeeded)$", v):
+    if re.search(r"(?:provided|available|ready|complete|completed|finished|done|successful|succeeded|deliverable|delivered)$", v):
+        return "completed"
+    if ("output" in v or "deliverable" in v or "result" in v) and re.search(r"(?:provided|available|ready|complete|completed|finished|done|successful|succeeded|deliverable|delivered|finalized|finalised)", v):
+        return "completed"
+    if "allprior" in v and ("completed" in v or "complete" in v or "deliverable" in v):
         return "completed"
     return None
 
@@ -240,8 +249,11 @@ def usage(r):
     return int(getattr(u,"input_tokens",0) or 0), int(getattr(u,"output_tokens",0) or 0)
 
 def price(i,o,model=None):
-    if model == WEB_MODEL:
+    m=str(model or MODEL)
+    if m == WEB_MODEL:
         return i/1e6*WEB_INPUT_PRICE + o/1e6*WEB_OUTPUT_PRICE
+    if m == WORKER_MODEL:
+        return i/1e6*WORKER_INPUT_PRICE + o/1e6*WORKER_OUTPUT_PRICE
     return i/1e6*INPUT_PRICE + o/1e6*OUTPUT_PRICE
 
 def clip(value, limit):
@@ -339,7 +351,7 @@ def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,sp
     try:
         client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"),timeout=call_timeout,max_retries=0)
         kw={"model":model,"input":prompt,"max_output_tokens":tokens}
-        if not web:
+        if not web and str(model).startswith("gpt-5"):
             kw["reasoning"]={"effort":"minimal"}
         if schema:
             kw["text"]={"format":{"type":"json_schema","name":schema[0],"schema":schema[1],"strict":True}}
@@ -736,13 +748,17 @@ def task_run(rid,tid):
         ag=q("SELECT * FROM agents WHERE id=?",(inst["agent_id"],),one=True)
         if not ag: raise RuntimeError("task agent missing")
         attempts=max(1,min(4,int(t["max_attempts"])))
+        cached_web_text=None
+        cached_source_urls=[]
+        cached_web_ready=False
         for n in range(1,attempts+1):
             if not run_active(rid): return
             if time.time()-started>RUN_TIMEOUT: raise RuntimeError("task run deadline exceeded")
             strategy="normal" if n==1 else "compact"
             x("UPDATE tasks SET status='running',attempts=?,updated_at=? WHERE id=? AND status='running'",(n,now(),tid))
             aid=uid("att"); ast=time.time()
-            x("INSERT INTO attempts(id,task_id,n,status,started_at,ended_at,latency_ms,input_tokens,output_tokens,cost,model,error_type,error_message,request_id,strategy,tool_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(aid,tid,n,"started",now(),None,None,0,0,0,MODEL,None,None,None,strategy,"web_search" if t["requires_web"] else "none"))
+            attempt_model = WORKER_MODEL if int(t["requires_web"]) or not int(t["requires_web"]) else MODEL
+            x("INSERT INTO attempts(id,task_id,n,status,started_at,ended_at,latency_ms,input_tokens,output_tokens,cost,model,error_type,error_message,request_id,strategy,tool_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(aid,tid,n,"started",now(),None,None,0,0,0,attempt_model,None,None,None,strategy,"web_search" if t["requires_web"] else "none"))
             try:
                 ctx=context(rid,t)
                 base=(f"You are {ag['name']}. {ag['instructions']}\nOBJECTIVE: {ctx['objective']}\n"
@@ -751,20 +767,24 @@ def task_run(rid,tid):
                       f"UPSTREAM TASKS: {jd(ctx['dependencies'])}\nEVIDENCE: {jd(ctx['evidence'])}\nMEMORY: {jd(ctx['memory'])}\n"
                       "Never fabricate facts, citations, URLs or calculations.")
                 if strategy=="compact": base += "\nBe concise. Return only information required by the contract."
-                source_urls=[]
+                source_urls=list(cached_source_urls)
                 task_timeout=max(30,min(MODEL_CALL_TIMEOUT,int(jl(t["contract"]).get("time_limit_seconds") or MODEL_CALL_TIMEOUT)))
                 if int(t["requires_web"]):
-                    research_prompt=base+"\nPerform current web research. Return a concise research memo with factual claims, uncertainty, and the source URLs used."
-                    task_timeout=max(30,min(RESEARCH_TIMEOUT,task_timeout))
-                    web_call=research_call(rid,tid,research_prompt,MODEL,float(t["budget_limit"])*.55,task_timeout)
-                    source_urls=[e["url"] for e in extract_sources(web_call["r"])]
-                    save_sources(rid,tid,web_call["r"])
-                    if not source_urls:
-                        event(rid,"RESEARCH_NO_SOURCE_METADATA","web research returned no parseable source metadata; worker must label evidence as insufficient",{},tid)
-                    transform_prompt=base+f"\nWEB RESEARCH MEMO:\n{clip(web_call['text'],MAX_WEB_MEMO_CHARS)}\nSOURCE URLS AVAILABLE:\n{jd(source_urls[:MAX_EVIDENCE_ITEMS])}\nConvert this into the required worker JSON. Use only source URLs from the available list; if none are available, set insufficient_evidence and do not invent citations."
-                    o=call(rid,tid,"task_structuring",transform_prompt,MODEL,False,("worker_output",WORKER),1200,float(t["budget_limit"])*.45,timeout_override=task_timeout)
+                    if not cached_web_ready:
+                        research_prompt=base+"\nPerform current web research. Return a concise research memo with factual claims, uncertainty, and the source URLs used."
+                        task_timeout=max(30,min(RESEARCH_TIMEOUT,task_timeout))
+                        web_call=research_call(rid,tid,research_prompt,WEB_MODEL,float(t["budget_limit"])*.55,task_timeout)
+                        cached_web_text=web_call["text"]
+                        cached_source_urls=[e["url"] for e in extract_sources(web_call["r"])]
+                        source_urls=list(cached_source_urls)
+                        save_sources(rid,tid,web_call["r"])
+                        cached_web_ready=True
+                        if not source_urls:
+                            event(rid,"RESEARCH_NO_SOURCE_METADATA","web research returned no parseable source metadata; worker must label evidence as insufficient",{},tid)
+                    transform_prompt=base+f"\nWEB RESEARCH MEMO:\n{clip(cached_web_text,MAX_WEB_MEMO_CHARS)}\nSOURCE URLS AVAILABLE:\n{jd(source_urls[:MAX_EVIDENCE_ITEMS])}\nConvert this into the required worker JSON. Use only source URLs from the available list; if none are available, set insufficient_evidence and do not invent citations."
+                    o=call(rid,tid,"task_structuring",transform_prompt,WORKER_MODEL,False,("worker_output",WORKER),WORKER_INITIAL_TOKENS if n==1 else WORKER_ESCALATED_TOKENS,float(t["budget_limit"])*.45,timeout_override=task_timeout)
                 else:
-                    o=call(rid,tid,"task",base+"\nReturn only the worker JSON schema.",MODEL,False,("worker_output",WORKER),2600,float(t["budget_limit"]),timeout_override=task_timeout)
+                    o=call(rid,tid,"task",base+"\nReturn only the worker JSON schema.",WORKER_MODEL,False,("worker_output",WORKER),WORKER_ESCALATED_TOKENS,float(t["budget_limit"]),timeout_override=task_timeout)
                 d=parse_json(o["text"])
                 d=update_claim_evidence(rid,tid,d)
                 claims=d.get("claims",[])
@@ -881,7 +901,7 @@ def schedule(rid):
     release_all_task_reservations(rid,None)
 
 def evaluate(rid,stage):
-    g=get_goal_from_run(rid); ts=q("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at")
+    g=get_goal_from_run(rid); ts=q("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at",(rid,))
     task_view=[{"id":t["plan_id"],"title":t["title"],"status":t["status"],"required":bool(t["required"]),"output":clip(t["output"],3000),"structured":clip(jd(jl(t["structured"])),4500),"confidence":t["confidence"]} for t in ts]
     ev_view=[{"id":e["id"],"title":clip(e["title"],180),"url":clip(e["url"],500),"publisher":clip(e["publisher"],120),"confidence":e["confidence"]} for e in q("SELECT id,title,url,publisher,confidence FROM evidence WHERE run_id=? ORDER BY retrieved_at DESC LIMIT ?",(rid,MAX_EVIDENCE_ITEMS))]
     prompt=f"""You are the independent verification layer for an AI workforce.
@@ -1124,7 +1144,7 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"verification_engine":"criterion_level_revision_v1","version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"verification_engine":"criterion_level_revision_v1","version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
 def dg(request:Request):
