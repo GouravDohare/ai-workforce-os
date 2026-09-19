@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.17"
+APP_VERSION = "0.4.18"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -517,6 +517,83 @@ def repair_plan(p, rid=None):
         event(rid,"PLAN_REPAIRED","planner inconsistencies normalized",{"changes":changes})
         print(f"PLAN_REPAIRED run={rid} changes={changes}",flush=True)
     return p, changes
+
+def normalize_plan_runtime_controls(p, rid=None):
+    """Normalize planner fields that are operational controls, not business semantics.
+
+    LLM planners occasionally emit values such as time_limit_seconds=0 or
+    max_attempts=9 even though the structured schema only constrains the type.
+    Those values are safe to repair deterministically; falling back to the
+    four-task plan would throw away otherwise valid orchestration decisions.
+    """
+    tasks=p.get("tasks") or []
+    changes=[]
+    for t in tasks:
+        tid=t.get("id")
+        ct=t.setdefault("contract", {})
+
+        # Execution timeout is an operational guardrail. Prefer a useful default
+        # when the planner emits a non-positive/malformed value; cap extreme
+        # values rather than allowing one task to consume the whole run.
+        raw_tl=ct.get("time_limit_seconds")
+        try:
+            tl=int(raw_tl)
+        except Exception:
+            tl=120
+        if tl < 15:
+            new_tl=120
+        elif tl > 900:
+            new_tl=900
+        else:
+            new_tl=tl
+        if raw_tl != new_tl:
+            changes.append({"task_id":tid,"field":"contract.time_limit_seconds","from":raw_tl,"to":new_tl,"reason":"runtime safety normalization"})
+        ct["time_limit_seconds"]=new_tl
+
+        # Retry count is likewise an execution policy, not task meaning.
+        raw_attempts=t.get("max_attempts")
+        try:
+            attempts=int(raw_attempts)
+        except Exception:
+            attempts=2
+        new_attempts=max(1,min(4,attempts))
+        if raw_attempts != new_attempts:
+            changes.append({"task_id":tid,"field":"max_attempts","from":raw_attempts,"to":new_attempts,"reason":"runtime safety normalization"})
+        t["max_attempts"]=new_attempts
+
+        # Remove duplicate dependency edges deterministically while keeping the
+        # first condition attached to the first occurrence.
+        deps=list(t.get("depends_on") or [])
+        conds=list(t.get("dependency_conditions") or [])
+        if len(conds) < len(deps):
+            conds += ["completed"] * (len(deps)-len(conds))
+            changes.append({"task_id":tid,"field":"dependency_conditions","reason":"filled missing dependency gates"})
+        elif len(conds) > len(deps):
+            conds=conds[:len(deps)]
+            changes.append({"task_id":tid,"field":"dependency_conditions","reason":"trimmed excess dependency gates"})
+        nd=[]; nc=[]; seen=set()
+        for dep,cond in zip(deps,conds):
+            if dep in seen:
+                changes.append({"task_id":tid,"field":"depends_on","removed":dep,"reason":"duplicate dependency edge"})
+                continue
+            seen.add(dep); nd.append(dep); nc.append(canonical_condition(cond) or "completed")
+        if nd != deps:
+            t["depends_on"]=nd
+        if nc != conds:
+            changes.append({"task_id":tid,"field":"dependency_conditions","from":conds,"to":nc,"reason":"canonical runtime gates"})
+        t["dependency_conditions"]=nc
+
+        if bool(t.get("requires_web")):
+            allowed=list(ct.get("allowed_tools") or [])
+            if "web_search" not in allowed:
+                allowed.append("web_search")
+                ct["allowed_tools"]=allowed
+                changes.append({"task_id":tid,"field":"contract.allowed_tools","added":"web_search","reason":"web task runtime requirement"})
+
+    if changes and rid:
+        event(rid,"PLAN_RUNTIME_NORMALIZED","planner runtime controls normalized",{"changes":changes})
+        print(f"PLAN_RUNTIME_NORMALIZED run={rid} changes={len(changes)}",flush=True)
+    return p,changes
 
 def normalize_plan_budgets(p, budget, rid=None):
     """Make task budgets deterministic and guarantee the sum fits the goal budget.
@@ -1057,15 +1134,17 @@ Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exa
             p=call(rid,None,"planner",planner_prompt,MODEL,False,("ceo_plan",PLAN),2800,min(1.0,g["budget"]*.18),timeout_override=PLANNER_TIMEOUT)
             plan=parse_json(p["text"])
             plan,role_changes=repair_plan(plan,rid)
+            plan,runtime_changes=normalize_plan_runtime_controls(plan,rid)
             plan,budget_changes=normalize_plan_budgets(plan,float(g["budget"]),rid)
             valid_plan(plan,float(g["budget"]))
             degraded=0
-            if role_changes or budget_changes:
-                event(rid,"PLANNER_VALIDATED_AFTER_REPAIR","planner output repaired and validated; no fallback used",
-                      {"role_changes":len(role_changes),"budget_changes":len(budget_changes)})
-                print(f"PLANNER_VALIDATED_AFTER_REPAIR run={rid} role_changes={len(role_changes)} budget_changes={len(budget_changes)}",flush=True)
-            event(rid,"PLANNER_COMPLETED","CEO planner produced a valid structured plan",{"agents":len(plan["agents"]),"tasks":len(plan["tasks"]),"repaired":bool(role_changes or budget_changes)})
-            print(f"PLANNER_COMPLETED run={rid} agents={len(plan['agents'])} tasks={len(plan['tasks'])} repaired={bool(role_changes or budget_changes)}",flush=True)
+            repaired=bool(role_changes or runtime_changes or budget_changes)
+            if repaired:
+                event(rid,"PLANNER_VALIDATED_AFTER_REPAIR","planner output was deterministically repaired and validated; no fallback used",
+                      {"role_changes":len(role_changes),"runtime_changes":len(runtime_changes),"budget_changes":len(budget_changes)})
+                print(f"PLANNER_VALIDATED_AFTER_REPAIR run={rid} role_changes={len(role_changes)} runtime_changes={len(runtime_changes)} budget_changes={len(budget_changes)}",flush=True)
+            event(rid,"PLANNER_COMPLETED","CEO planner produced a valid structured plan",{"agents":len(plan["agents"]),"tasks":len(plan["tasks"]),"repaired":repaired})
+            print(f"PLANNER_COMPLETED run={rid} agents={len(plan['agents'])} tasks={len(plan['tasks'])} repaired={repaired}",flush=True)
         except Exception as e:
             event(rid,"PLANNER_FALLBACK","planner output could not be safely repaired/validated; deterministic fallback used",{"error_type":classify(e),"error":str(e)})
             print(f"PLANNER_FALLBACK run={rid} error_type={classify(e)} error={e}",flush=True)
@@ -1184,7 +1263,7 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"verification_engine":"criterion_level_revision_v1","version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"web_model":WEB_MODEL,"worker_model":WORKER_MODEL,"worker_initial_tokens":WORKER_INITIAL_TOKENS,"worker_escalated_tokens":WORKER_ESCALATED_TOKENS,"max_concurrent_model_calls":MAX_CONCURRENT_MODEL_CALLS,"model_retry_count":MODEL_RETRY_COUNT,"max_prompt_chars":MAX_PROMPT_CHARS,"max_model_request_estimated_tokens":MAX_MODEL_REQUEST_ESTIMATED_TOKENS,"task_budget_fraction":TASK_BUDGET_FRACTION,"planner_runtime_normalization":True,"verification_engine":"criterion_level_revision_v1","version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
 def dg(request:Request):
@@ -1258,7 +1337,7 @@ async function refresh(){
  h+='<div class="card"><h2>Task graph</h2>'+(d.tasks.map(t=>'<div class="task"><b>'+E(t.title)+'</b> <span class="badge">'+E(t.status)+'</span><div class="muted">id '+E(t.plan_id||'')+' | attempts '+Number(t.attempts||0)+' | spend $'+Number(t.spent||0).toFixed(4)+' | confidence '+E(t.confidence??'-')+'</div>'+(t.error_message?'<div class="error"><b>'+E((t.error_type==='transient'?'Temporary execution issue':t.error_type==='strategy'?'Strategy adjustment required':t.error_type==='budget'?'Budget limit reached':t.error_type==='logical'?'Task dependency or logic issue':'Task failed'))+'</b><div>'+E(t.error_message)+'</div></div>':'')+'</div>').join('')||'No tasks created.')+'</div>';
  const latest=(d.evaluations||[])[0];
  if(latest){let fails=[]; try{fails=JSON.parse(latest.failures||'{}').criterion_results||[]}catch(_){}; h+='<div class="card"><h2>Verification details</h2><div class="muted">stage '+E(latest.stage||'')+' | score '+Number(latest.score||0).toFixed(2)+' | '+(latest.passed?'passed':'failed')+'</div>'; if(fails.length){h+='<div class="task"><b>Criterion review</b>'+fails.map(c=>'<div style="margin-top:8px"><b>'+E(c.status||'')+'</b> â '+E(c.criterion||'')+'<div class="muted">'+E(c.reason||'')+'</div>'+(c.evidence_needed?'<div class="muted">Evidence/action: '+E(c.evidence_needed)+'</div>':'')+'</div>').join('')+'</div>';} h+='</div>';}
- h+='<div class="card"><h2>Evidence</h2>'+(d.evidence.map(e=>{const u=U(e.url);let host='';try{host=u?new URL(u).hostname.replace('www.',''):''}catch(_){host=''}return '<div class="task"><b>'+E(e.title||'Source')+'</b>'+(e.publisher?'<div class="muted">'+E(e.publisher)+'</div>':'')+(u?'<div class="muted">'+E(host)+'</div><a target="_blank" rel="noopener noreferrer" href="'+E(u)+'">Open source</a>':'')+'</div>'}).join('')||'No evidence yet.')+'</div>';
+ h+='<div class="card"><h2>Evidence</h2>'+(d.evidence.map(e=>{const u=U(e.url);let host='';let title=E(e.title||'Source');try{if(u){host=new URL(u).hostname.replace('www.','');if(!e.title||String(e.title).toLowerCase().indexOf('http://')===0||String(e.title).toLowerCase().indexOf('https://')===0) title=E(host+' source');}}catch(_){}return '<div class="task"><b>'+title+'</b>'+(e.publisher?'<div class="muted">'+E(e.publisher)+'</div>':'')+(u?'<div class="muted">'+E(host)+'</div><a target="_blank" rel="noopener noreferrer" href="'+E(u)+'">Open source</a>':'')+'</div>'}).join('')||'No evidence yet.')+'</div>';
  if(g.final_output)h+='<div class="card"><h2>Final output</h2><pre>'+E(g.final_output)+'</pre></div>';
  if(['queued','planning','executing','evaluating','replanning'].includes(g.status))h+='<form method="post" action="/goals/%s/cancel"><button>Cancel run</button></form>'; if(['failed','incomplete','interrupted'].includes(g.status))h+='<form method="post" action="/goals/%s/retry"><button>Retry</button></form>';
  document.getElementById('a').innerHTML=h;
