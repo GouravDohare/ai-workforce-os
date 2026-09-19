@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 
-APP_VERSION = "0.4.7"
+APP_VERSION = "0.4.8"
 SCHEMA_VERSION = "046-2"
 DB_ENV = os.getenv("WORKFORCE_DB", "")
 DB = DB_ENV or "workforce_v0466.db"
@@ -24,6 +24,9 @@ MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
 RUN_TIMEOUT = float(os.getenv("RUN_TIMEOUT_SECONDS", "900"))
 PLANNER_TIMEOUT = float(os.getenv("PLANNER_TIMEOUT_SECONDS", "75"))
 MODEL_CALL_TIMEOUT = float(os.getenv("MODEL_CALL_TIMEOUT_SECONDS", "150"))
+RESEARCH_TIMEOUT = float(os.getenv("RESEARCH_TIMEOUT_SECONDS", "180"))
+RESEARCH_INITIAL_TOKENS = int(os.getenv("RESEARCH_INITIAL_TOKENS", "6000"))
+RESEARCH_ESCALATED_TOKENS = int(os.getenv("RESEARCH_ESCALATED_TOKENS", "8000"))
 
 app = FastAPI(title="AI Workforce OS", version=APP_VERSION)
 lock = threading.RLock()
@@ -273,6 +276,29 @@ def call(rid,tid,purpose,prompt,model=MODEL,web=False,schema=None,tokens=3000,sp
         print(f"MODEL_FAILED run={rid} task={tid} purpose={purpose} latency_ms={el} error_type={classify(e)} error={e}",flush=True)
         raise
 
+def research_call(rid, tid, prompt, model, spend_cap):
+    """Run web research with an adaptive token budget. A max-output truncation gets
+    one materially different retry: shorter instructions and a larger output ceiling.
+    Other failures are left to the task-level retry classifier."""
+    try:
+        return call(rid, tid, "web_research", prompt, model, True, None,
+                    RESEARCH_INITIAL_TOKENS, spend_cap, timeout_override=RESEARCH_TIMEOUT)
+    except Exception as e:
+        msg=str(e)
+        if "incomplete_output:max_output_tokens" not in msg:
+            raise
+        event(rid, "RESEARCH_ESCALATED", "web research output ceiling reached; escalating with compact prompt",
+              {"initial_tokens":RESEARCH_INITIAL_TOKENS,"escalated_tokens":RESEARCH_ESCALATED_TOKENS}, tid)
+        print(f"RESEARCH_ESCALATED run={rid} task={tid} from={RESEARCH_INITIAL_TOKENS} to={RESEARCH_ESCALATED_TOKENS}", flush=True)
+        compact=(
+            "Perform focused current web research for this task. Do not write a long essay. "
+            "Return a concise evidence memo: prioritize the most decision-relevant facts, "
+            "uncertainties, and source URLs. Use at most 12 bullets and avoid repeating source text.\n"
+            + prompt
+        )
+        return call(rid, tid, "web_research_escalated", compact, model, True, None,
+                    RESEARCH_ESCALATED_TOKENS, spend_cap, timeout_override=RESEARCH_TIMEOUT)
+
 # Strict schemas: every object property is required, with nullable values where optional data is needed.
 PLAN={"type":"object","additionalProperties":False,"properties":{
     "agents":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
@@ -299,6 +325,50 @@ EVAL={"type":"object","additionalProperties":False,"properties":{
     "contradictions":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{"claim":{"type":"string"},"other_claim":{"type":"string"},"reason":{"type":"string"}},"required":["claim","other_claim","reason"]}},
     "replan_tasks":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{"title":{"type":"string"},"reason":{"type":"string"}},"required":["title","reason"]}}
 },"required":["passed","score","dimensions","failed_checks","recommendations","contradictions","replan_tasks"]}
+
+def repair_plan(p, rid=None):
+    """Repair safe planner inconsistencies without inventing new capabilities.
+    The observed failure was a task owner role that was not declared by the planner.
+    We repair obvious aliases (e.g. market_research -> research) and otherwise leave
+    the plan for deterministic fallback rather than silently guessing."""
+    agents=p.get("agents") or []
+    roles=[str(a.get("role","")).strip() for a in agents if a.get("role")]
+    if not roles:
+        return p, []
+    def norm(x):
+        return re.sub(r"[^a-z0-9]", "", str(x).lower())
+    changes=[]
+    for t in p.get("tasks",[]):
+        r=str(t.get("agent_role","")).strip()
+        if r in roles:
+            continue
+        nr=norm(r)
+        exact=[z for z in roles if norm(z)==nr]
+        if exact:
+            chosen=exact[0]
+        else:
+            contains=[z for z in roles if norm(z) in nr or nr in norm(z)]
+            if len(contains)==1:
+                chosen=contains[0]
+            else:
+                # Score role + agent metadata against task text; only repair when
+                # there is a clear lexical signal.
+                text=norm(" ".join([r,t.get("title",""),t.get("instructions","")]))
+                scores=[]
+                for a in agents:
+                    rr=str(a.get("role","")); meta=norm(" ".join([rr,a.get("name","")," ".join(a.get("capabilities",[]))," ".join(a.get("skills",[]))]))
+                    overlap=sum(1 for token in re.findall(r"[a-z0-9]{4,}", meta) if token in text)
+                    scores.append((overlap,rr))
+                scores.sort(reverse=True)
+                if not scores or scores[0][0] < 1 or (len(scores)>1 and scores[0][0]==scores[1][0]):
+                    continue
+                chosen=scores[0][1]
+        t["agent_role"]=chosen
+        changes.append({"task_id":t.get("id"),"from":r,"to":chosen})
+    if changes and rid:
+        event(rid,"PLAN_REPAIRED","planner task-owner aliases normalized",{"changes":changes})
+        print(f"PLAN_REPAIRED run={rid} changes={changes}",flush=True)
+    return p, changes
 
 def valid_plan(p,budget):
     if not p.get("agents") or not p.get("tasks") or len(p["tasks"])>16: raise ValueError("invalid plan size")
@@ -418,7 +488,7 @@ def task_run(rid,tid):
                 source_urls=[]
                 if int(t["requires_web"]):
                     research_prompt=base+"\nPerform current web research. Return a concise research memo with factual claims, uncertainty, and the source URLs used."
-                    web_call=call(rid,tid,"web_research",research_prompt,MODEL,True,None,2600,float(t["budget_limit"])*.55)
+                    web_call=research_call(rid,tid,research_prompt,MODEL,float(t["budget_limit"])*.55)
                     source_urls=[e["url"] for e in extract_sources(web_call["r"])]
                     save_sources(rid,tid,web_call["r"])
                     transform_prompt=base+f"\nWEB RESEARCH MEMO:\n{web_call['text']}\nSOURCE URLS AVAILABLE:\n{jd(source_urls)}\nConvert this into the required worker JSON. Use only source URLs from the available list; do not invent URLs."
@@ -531,9 +601,9 @@ DESCRIPTION: {g['description']}
 SUCCESS CRITERIA: {g['criteria']}
 BUDGET: ${g['budget']}
 Return ONLY the required plan JSON. Keep it compact: normally 3-6 agents and 4-8 tasks.
-Every task must have a clear owner, explicit dependencies, a machine-readable contract, a realistic positive budget, and a short instruction. Do not create unnecessary agents or tasks. Use web research only where current external facts are genuinely required. Separate research from synthesis and verification."""
+Every task must have a clear owner. CRITICAL INVARIANT: task.agent_role MUST exactly equal one of the declared agents[].role values; never invent an owner role. Explicit dependencies must reference task IDs that exist. Every task needs a machine-readable contract, realistic positive budget, and short instruction. Do not create unnecessary agents or tasks. Use web research only where current external facts are genuinely required. Separate research from synthesis and verification."""
             p=call(rid,None,"planner",planner_prompt,MODEL,False,("ceo_plan",PLAN),2800,min(1.0,g["budget"]*.18),timeout_override=PLANNER_TIMEOUT)
-            plan=parse_json(p["text"]);valid_plan(plan,float(g["budget"]));degraded=0
+            plan=parse_json(p["text"]);plan,_changes=repair_plan(plan,rid);valid_plan(plan,float(g["budget"]));degraded=0
             event(rid,"PLANNER_COMPLETED","CEO planner produced a valid structured plan",{"agents":len(plan["agents"]),"tasks":len(plan["tasks"])})
             print(f"PLANNER_COMPLETED run={rid} agents={len(plan['agents'])} tasks={len(plan['tasks'])}",flush=True)
         except Exception as e:
@@ -622,7 +692,7 @@ def boot():
 
 @app.get("/health")
 def health(expected_version=None):
-    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"version_match":expected_version in (None,APP_VERSION)}
+    return {"status":"ok","app_version":APP_VERSION,"schema_version":SCHEMA_VERSION,"model":MODEL,"db":DB,"web_research":WEB,"auth_enabled":bool(AUTH),"planner_timeout_seconds":PLANNER_TIMEOUT,"model_call_timeout_seconds":MODEL_CALL_TIMEOUT,"run_timeout_seconds":RUN_TIMEOUT,"research_timeout_seconds":RESEARCH_TIMEOUT,"research_initial_tokens":RESEARCH_INITIAL_TOKENS,"research_escalated_tokens":RESEARCH_ESCALATED_TOKENS,"version_match":expected_version in (None,APP_VERSION)}
 
 @app.get("/diagnostics/generation")
 def dg():
